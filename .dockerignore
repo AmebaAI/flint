@@ -1,0 +1,16 @@
+.git
+.jj
+target/
+.data/
+.env
+.env.*
+!.env.example
+.gitignore
+.dockerignore
+.github/
+.agents/
+.pi-subagents/
+.scratch/
+.DS_Store
+.idea/
+.vscode/

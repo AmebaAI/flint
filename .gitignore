@@ -1,0 +1,16 @@
+# Rust build output
+target/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime data
+.data/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+.pi-subagents/

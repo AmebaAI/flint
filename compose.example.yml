@@ -1,0 +1,36 @@
+services:
+  flint:
+    image: flint:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "8080"
+      AGENTCORE_RUNTIME_CATALOG: /etc/flint/runtime-catalog.json
+      AGENTCORE_RUNTIME_OWNER: ${AGENTCORE_RUNTIME_OWNER:?required}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:${FLINT_PORT:-35469}:8080"
+    networks:
+      - flint-agentcore
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "${FLINT_RUNTIME_CATALOG:-./config/runtime-catalog.compose.example.json}:/etc/flint/runtime-catalog.json:ro"
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, "http://127.0.0.1:8080/_local/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+networks:
+  flint-agentcore:
+    name: ${FLINT_DOCKER_NETWORK:-flint-agentcore}

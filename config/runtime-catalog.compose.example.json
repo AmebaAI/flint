@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "runtimes": [
+    {
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-west-2:000000000000:runtime/flint_local",
+      "runtimeId": "flint_local",
+      "accountId": "000000000000",
+      "defaultQualifier": "CONTAINER",
+      "deployments": [
+        {
+          "qualifier": "CONTAINER",
+          "image": "flint-runtime-fixture:local",
+          "protocol": "http",
+          "protocolPort": 8080,
+          "invocationPath": "/invocations",
+          "pingPath": "/ping",
+          "agentCardPath": "/.well-known/agent-card.json",
+          "resources": {
+            "memoryBytes": 268435456,
+            "nanoCpus": 500000000,
+            "pidsLimit": 64,
+            "readOnlyRootFilesystem": true,
+            "workspaceSizeBytes": 67108864,
+            "workspaceNoExec": true
+          },
+          "command": {
+            "enabled": true,
+            "shell": ["/bin/sh", "-lc"],
+            "maxConcurrency": 1,
+            "timeoutSeconds": 30,
+            "maxOutputBytes": 1048576
+          },
+          "lifecycle": {
+            "startupTimeoutSeconds": 30,
+            "idleTimeoutSeconds": 300,
+            "maximumLifetimeSeconds": 1800
+          },
+          "allowedCustomHeaders": ["x-flint-invocation-id"],
+          "authentication": {
+            "mode": "permissive",
+            "allowedClockSkewSeconds": 300,
+            "credentials": []
+          },
+          "policy": {
+            "statements": []
+          },
+          "connectivity": {
+            "mode": "container",
+            "dockerNetwork": "flint-agentcore",
+            "addHostGateway": false
+          },
+          "limits": {
+            "maxRequestBytes": 2097152,
+            "maxResponseBytes": 2097152,
+            "maxChunkBytes": 262144,
+            "maxDurationSeconds": 60
+          }
+        }
+      ]
+    }
+  ]
+}
