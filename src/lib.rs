@@ -2,13 +2,11 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use async_trait::async_trait;
-#[cfg(test)]
-use axum::extract::State;
-use axum::{Json, Router, routing::get};
+use axum::{Json, Router, extract::State, routing::get};
 #[cfg(test)]
 use axum::{extract::Path, http::StatusCode};
-use catalog::RuntimeCatalog;
-use config::RuntimeConfig;
+use catalog::{RuntimeCatalog, RuntimeRegistry, RuntimeRegistryHealth};
+use config::{RuntimeConfig, RuntimeSourceConfig};
 use docker::{DockerBackendError, DockerSessionBackend};
 use edge::RuntimeApiState;
 #[cfg(test)]
@@ -44,22 +42,53 @@ struct Health {
     status: &'static str,
 }
 
+#[derive(Serialize)]
+struct RuntimeHealth {
+    service: &'static str,
+    status: &'static str,
+    #[serde(flatten)]
+    registry: RuntimeRegistryHealth,
+}
+
 pub async fn app() -> Result<Router, StartupError> {
     production_router(RuntimeConfig::from_env()?).await
 }
 
 async fn production_router(config: RuntimeConfig) -> Result<Router, StartupError> {
-    let catalog = config.catalog;
-    let deployment = catalog.default_snapshot();
-    tracing::info!(
-        catalog = %catalog.source().display(),
-        runtime_arn = %deployment.runtime_arn,
-        qualifier = %deployment.qualifier,
-        "loaded immutable runtime catalog snapshot"
+    let (catalog, discovery) = match config.runtime_source {
+        RuntimeSourceConfig::Catalog { catalog } => (catalog, None),
+        RuntimeSourceConfig::Docker(discovery) => {
+            tracing::info!(
+                refresh_seconds = discovery.refresh_interval.as_secs(),
+                "configured Docker runtime discovery"
+            );
+            (RuntimeCatalog::empty_discovery(), Some(discovery))
+        }
+    };
+    let registry = RuntimeRegistry::new(catalog);
+    let session_backend = Arc::new(
+        DockerSessionBackend::connect_with_registry(
+            config.runtime_owner,
+            registry.clone(),
+            discovery,
+        )
+        .await?,
     );
-    let runtime_owner = config.runtime_owner;
-    let session_backend =
-        Arc::new(DockerSessionBackend::connect(runtime_owner, catalog.clone()).await?);
+    let catalog = registry.snapshot();
+    if let Some(deployment) = catalog.default_snapshot_opt() {
+        tracing::info!(
+            source = %catalog.source(),
+            runtime_arn = %deployment.runtime_arn,
+            qualifier = %deployment.qualifier,
+            "loaded runtime catalog snapshot"
+        );
+    } else {
+        tracing::info!(
+            source = %catalog.source(),
+            deployment_count = catalog.len(),
+            "started with an empty runtime registry"
+        );
+    }
     let adopted = session_backend.take_adopted_sessions().await;
     let sessions = SessionManager::new(session_backend);
     for (key, deployment, container) in adopted {
@@ -69,7 +98,7 @@ async fn production_router(config: RuntimeConfig) -> Result<Router, StartupError
                 message: format!("failed to adopt runtime session: {error}"),
             })?;
     }
-    Ok(runtime_router_with_sessions(catalog, sessions))
+    Ok(runtime_router_with_registry(registry, sessions))
 }
 
 pub fn health_app() -> Router {
@@ -78,17 +107,22 @@ pub fn health_app() -> Router {
 
 #[cfg(test)]
 fn runtime_router(catalog: RuntimeCatalog, runtime: InvocationRuntime) -> Router {
-    runtime_router_with_state(RuntimeApiState::new(catalog, runtime))
+    runtime_router_with_state(RuntimeApiState::new(RuntimeRegistry::new(catalog), runtime))
 }
 
+#[cfg(test)]
 fn runtime_router_with_sessions(catalog: RuntimeCatalog, sessions: SessionManager) -> Router {
-    runtime_router_with_state(RuntimeApiState::with_sessions(catalog, sessions))
+    runtime_router_with_registry(RuntimeRegistry::new(catalog), sessions)
+}
+
+fn runtime_router_with_registry(registry: RuntimeRegistry, sessions: SessionManager) -> Router {
+    runtime_router_with_state(RuntimeApiState::with_sessions(registry, sessions))
 }
 
 fn runtime_router_with_state(state: RuntimeApiState) -> Router {
     let router = Router::new()
         .merge(edge::routes())
-        .route("/_local/health", get(health))
+        .route("/_local/health", get(runtime_health))
         .route("/_local/ping", get(ping));
     #[cfg(test)]
     let router = router
@@ -109,6 +143,15 @@ async fn health() -> Json<Health> {
     Json(Health {
         service: "flint",
         status: "ready",
+    })
+}
+
+async fn runtime_health(State(state): State<RuntimeApiState>) -> Json<RuntimeHealth> {
+    let registry = state.registry_health();
+    Json(RuntimeHealth {
+        service: "flint",
+        status: registry.discovery_status,
+        registry,
     })
 }
 

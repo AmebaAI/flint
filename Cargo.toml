@@ -2,6 +2,9 @@
 name = "flint"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
+description = "A local development-focused AWS AgentCore Runtime emulator"
+repository = "https://github.com/AmebaAI/flint"
 license = "GPL-3.0-only"
 
 [dependencies]
@@ -42,7 +45,10 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-aws-sdk-bedrockagentcore = "=1.59.0"
+aws-sdk-bedrockagentcore = { version = "=1.60.0", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
 tower = { version = "0.5.3", features = ["util"] }
 
 [lints.rust]

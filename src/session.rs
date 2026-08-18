@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::catalog::ResolvedRuntime;
+use crate::catalog::{LocalIdentity, ResolvedRuntime};
 #[cfg(test)]
 use crate::runtime::InvocationRuntime;
 
@@ -281,10 +281,12 @@ impl Drop for StopTransitionGuard {
 enum SessionEntry {
     Starting {
         generation: u64,
+        runtime: Arc<ResolvedRuntime>,
         cancellation: CancellationToken,
     },
     Ready {
         generation: u64,
+        runtime: Arc<ResolvedRuntime>,
         container: Arc<SessionContainer>,
         cancellation: CancellationToken,
         started_at: Instant,
@@ -295,16 +297,29 @@ enum SessionEntry {
     },
     Stopping {
         generation: u64,
+        runtime: Arc<ResolvedRuntime>,
         client_token: Option<String>,
         notify: Arc<Notify>,
         outcome: Arc<Mutex<Option<Result<(), String>>>>,
     },
     Failed {
         generation: u64,
+        runtime: Arc<ResolvedRuntime>,
         message: String,
         container: Option<Arc<SessionContainer>>,
         cancellation: CancellationToken,
     },
+}
+
+impl SessionEntry {
+    fn runtime(&self) -> &Arc<ResolvedRuntime> {
+        match self {
+            Self::Starting { runtime, .. }
+            | Self::Ready { runtime, .. }
+            | Self::Stopping { runtime, .. }
+            | Self::Failed { runtime, .. } => runtime,
+        }
+    }
 }
 
 async fn finish_stop(
@@ -319,13 +334,15 @@ async fn finish_stop(
     cancellation.cancel();
     let stopped = inner.backend.stop(&container).await;
     let mut entries = inner.entries.lock().expect("session state lock");
-    if matches!(
-        entries.get(&key),
+    let runtime = match entries.get(&key) {
         Some(SessionEntry::Stopping {
             generation: current,
+            runtime,
             ..
-        }) if *current == generation
-    ) {
+        }) if *current == generation => Some(Arc::clone(runtime)),
+        _ => None,
+    };
+    if let Some(runtime) = runtime {
         match &stopped {
             Ok(()) => {
                 entries.remove(&key);
@@ -335,6 +352,7 @@ async fn finish_stop(
                     key,
                     SessionEntry::Failed {
                         generation,
+                        runtime,
                         message: format!("session cleanup must be retried: {message}"),
                         container: Some(container),
                         cancellation,
@@ -361,6 +379,36 @@ impl SessionManager {
         manager
     }
 
+    pub(crate) fn pinned_runtime(
+        &self,
+        runtime_identifier: &str,
+        account_id: Option<&str>,
+        qualifier: Option<&str>,
+        runtime_session_id: &str,
+        identity: &LocalIdentity,
+    ) -> Option<Arc<ResolvedRuntime>> {
+        let entries = self.inner.entries.lock().expect("session state lock");
+        let mut matches = entries.iter().filter_map(|(key, entry)| {
+            let runtime = entry.runtime();
+            if key.runtime_session_id != runtime_session_id
+                || qualifier.is_some_and(|value| value != runtime.qualifier)
+                || runtime.account_id != identity.account_id
+                || runtime.runtime_arn.split(':').nth(3) != Some(identity.region.as_str())
+            {
+                return None;
+            }
+            let identity_matches = if runtime_identifier == runtime.runtime_arn {
+                account_id.is_none_or(|value| value == runtime.account_id)
+            } else {
+                runtime_identifier == runtime.runtime_id
+                    && account_id == Some(runtime.account_id.as_str())
+            };
+            identity_matches.then(|| Arc::clone(runtime))
+        });
+        let pinned = matches.next()?;
+        matches.next().is_none().then_some(pinned)
+    }
+
     pub(crate) fn adopt(
         &self,
         runtime: Arc<ResolvedRuntime>,
@@ -381,6 +429,7 @@ impl SessionManager {
             key,
             SessionEntry::Ready {
                 generation,
+                runtime: Arc::clone(&runtime),
                 container: Arc::new(container),
                 cancellation,
                 started_at,
@@ -460,6 +509,7 @@ impl SessionManager {
                 key.clone(),
                 SessionEntry::Starting {
                     generation,
+                    runtime: Arc::clone(&runtime),
                     cancellation: cancellation.clone(),
                 },
             );
@@ -495,6 +545,7 @@ impl SessionManager {
                             key.clone(),
                             SessionEntry::Ready {
                                 generation,
+                                runtime: Arc::clone(&runtime),
                                 container: Arc::clone(&container),
                                 cancellation,
                                 started_at,
@@ -519,6 +570,7 @@ impl SessionManager {
                             key.clone(),
                             SessionEntry::Failed {
                                 generation,
+                                runtime: Arc::clone(&runtime),
                                 message: message.clone(),
                                 container: None,
                                 cancellation,
@@ -542,6 +594,7 @@ impl SessionManager {
                                 key.clone(),
                                 SessionEntry::Failed {
                                     generation,
+                                    runtime: Arc::clone(&runtime),
                                     message: message.clone(),
                                     container: None,
                                     cancellation: CancellationToken::new(),
@@ -585,6 +638,7 @@ impl SessionManager {
                             key.clone(),
                             SessionEntry::Failed {
                                 generation,
+                                runtime: Arc::clone(&runtime),
                                 message: format!("session cleanup must be retried: {message}"),
                                 container: Some(Arc::new(container)),
                                 cancellation: CancellationToken::new(),
@@ -655,6 +709,7 @@ impl SessionManager {
                 }) => StopPlan::Complete,
                 Some(SessionEntry::Failed {
                     generation,
+                    runtime,
                     container: Some(container),
                     cancellation,
                     ..
@@ -666,6 +721,7 @@ impl SessionManager {
                         key.clone(),
                         SessionEntry::Stopping {
                             generation,
+                            runtime,
                             client_token,
                             notify: Arc::clone(&notify),
                             outcome: Arc::clone(&outcome),
@@ -681,6 +737,7 @@ impl SessionManager {
                 }
                 Some(SessionEntry::Starting {
                     generation,
+                    runtime,
                     cancellation,
                 }) => {
                     cancellation.cancel();
@@ -691,6 +748,7 @@ impl SessionManager {
                         key.clone(),
                         SessionEntry::Stopping {
                             generation,
+                            runtime,
                             client_token,
                             notify,
                             outcome: Arc::clone(&outcome),
@@ -700,6 +758,7 @@ impl SessionManager {
                 }
                 Some(SessionEntry::Ready {
                     generation,
+                    runtime,
                     container,
                     cancellation,
                     ..
@@ -711,6 +770,7 @@ impl SessionManager {
                         key.clone(),
                         SessionEntry::Stopping {
                             generation,
+                            runtime,
                             client_token,
                             notify: Arc::clone(&notify),
                             outcome: Arc::clone(&outcome),
@@ -726,6 +786,7 @@ impl SessionManager {
                 }
                 Some(SessionEntry::Stopping {
                     generation,
+                    runtime,
                     client_token: active_token,
                     notify,
                     outcome,
@@ -735,6 +796,7 @@ impl SessionManager {
                         key.clone(),
                         SessionEntry::Stopping {
                             generation,
+                            runtime,
                             client_token: active_token.clone(),
                             notify,
                             outcome: Arc::clone(&outcome),
@@ -901,19 +963,25 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let (container, cancellation, notify, outcome) = {
             let mut entries = self.inner.entries.lock().expect("session state lock");
-            let (generation, container, cancellation) = match entries.remove(&key) {
+            let (generation, runtime, container, cancellation) = match entries.remove(&key) {
                 Some(SessionEntry::Ready {
                     generation,
+                    runtime,
                     container,
                     cancellation,
                     ..
-                }) if generation == expected_generation => (generation, container, cancellation),
+                }) if generation == expected_generation => {
+                    (generation, runtime, container, cancellation)
+                }
                 Some(SessionEntry::Failed {
                     generation,
+                    runtime,
                     container: Some(container),
                     cancellation,
                     ..
-                }) if generation == expected_generation => (generation, container, cancellation),
+                }) if generation == expected_generation => {
+                    (generation, runtime, container, cancellation)
+                }
                 Some(entry) => {
                     entries.insert(key.clone(), entry);
                     return Ok(());
@@ -927,6 +995,7 @@ impl SessionManager {
                 key.clone(),
                 SessionEntry::Stopping {
                     generation,
+                    runtime,
                     client_token: Some("lifecycle-reaper".to_owned()),
                     notify: Arc::clone(&notify),
                     outcome: Arc::clone(&outcome),
@@ -1074,7 +1143,7 @@ mod tests {
         CommandEvent, CommandExecution, SessionBackend, SessionContainer, SessionEntry,
         SessionError, SessionHealth, SessionKey, SessionManager,
     };
-    use crate::catalog::RuntimeCatalog;
+    use crate::catalog::{LocalIdentity, RuntimeCatalog};
 
     #[derive(Default)]
     struct FakeBackend {
@@ -1195,6 +1264,62 @@ mod tests {
             .expect("other session lease");
         assert_ne!(other.container.id, first_id);
         assert_eq!(backend.starts.lock().expect("starts lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn active_session_keeps_its_pinned_deployment_until_stopped() {
+        let manager = SessionManager::new(Arc::new(FakeBackend::default()));
+        let original = runtime();
+        let lease = manager
+            .acquire(Arc::clone(&original), "pinned-session".to_owned())
+            .await
+            .expect("start pinned session");
+        drop(lease);
+
+        let mut replacement = (*original).clone();
+        replacement.catalog_generation = "replacement-generation".to_owned();
+        replacement.image_id = "sha256:replacement".to_owned();
+        let replacement = Arc::new(replacement);
+        let reused = manager
+            .acquire(replacement, "pinned-session".to_owned())
+            .await
+            .expect("reuse pinned session");
+        drop(reused);
+
+        let identity = LocalIdentity {
+            region: original
+                .runtime_arn
+                .split(':')
+                .nth(3)
+                .expect("runtime region")
+                .to_owned(),
+            account_id: original.account_id.clone(),
+        };
+        let pinned = manager
+            .pinned_runtime(
+                &original.runtime_id,
+                Some(&original.account_id),
+                None,
+                "pinned-session",
+                &identity,
+            )
+            .expect("pinned deployment");
+        assert!(Arc::ptr_eq(&pinned, &original));
+        manager
+            .stop(&pinned, "pinned-session".to_owned(), None)
+            .await
+            .expect("stop pinned session");
+        assert!(
+            manager
+                .pinned_runtime(
+                    &original.runtime_arn,
+                    None,
+                    Some(&original.qualifier),
+                    "pinned-session",
+                    &identity,
+                )
+                .is_none()
+        );
     }
 
     #[tokio::test]

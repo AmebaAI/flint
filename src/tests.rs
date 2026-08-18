@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 fn invocation_request(invocation_id: &str, identity_id: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-west-2%3A000000000000%3Aruntime%2Fflint_local/invocations")
+        .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A000000000000%3Aruntime%2Fflint_local/invocations")
         .header("content-type", "application/json")
         .header("x-amzn-bedrock-agentcore-runtime-session-id", identity_id)
         .body(Body::from(
@@ -45,7 +45,7 @@ fn invocation_request(invocation_id: &str, identity_id: &str) -> Request<Body> {
 fn stop_session_request(identity_id: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-west-2%3A000000000000%3Aruntime%2Fflint_local/stopruntimesession")
+        .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A000000000000%3Aruntime%2Fflint_local/stopruntimesession")
         .header("content-type", "application/json")
         .header("x-amzn-bedrock-agentcore-runtime-session-id", identity_id)
         .body(Body::from(

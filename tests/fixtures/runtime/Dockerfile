@@ -11,4 +11,5 @@ ENV PYTHONDONTWRITEBYTECODE=1
 USER 10001:10001
 WORKDIR /workspace
 EXPOSE 8080
+LABEL ai.ameba.flint.runtime.descriptor="{\"name\":\"flint_local\",\"protocol\":\"HTTP\",\"environmentVariables\":[\"FLINT_FIXTURE_ALLOWED\",\"FLINT_FIXTURE_UNAPPROVED\",\"FLINT_FIXTURE_UNSET\"]}"
 ENTRYPOINT ["python3", "/opt/flint-runtime/server.py"]

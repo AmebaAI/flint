@@ -12,8 +12,8 @@ use bollard::{
     exec::{CreateExecOptions, StartExecOptions, StartExecResults},
     models::{ContainerCreateBody, HostConfig, PortBinding},
     query_parameters::{
-        CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-        StartContainerOptions,
+        CreateContainerOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder,
+        ListImagesOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
 use futures_util::StreamExt;
@@ -38,7 +38,12 @@ use crate::runtime::{
     RuntimeInfrastructureHealth, RuntimeLimits,
 };
 use crate::{
-    catalog::{ConnectivityMode, ResolvedRuntime, RuntimeCatalog},
+    catalog::{
+        Connectivity, ConnectivityMode, DiscoveredRuntimeImage, DiscoveryPolicy,
+        RUNTIME_DESCRIPTOR_LABEL, ResolvedImage, ResolvedRuntime, RuntimeCatalog, RuntimeRegistry,
+        parse_runtime_descriptor,
+    },
+    config::DockerDiscoveryConfig,
     session::{
         CommandEvent, CommandExecution, SessionBackend, SessionContainer, SessionHealth, SessionKey,
     },
@@ -478,6 +483,8 @@ impl ContainerRuntime for DockerContainerRuntime {
 pub(crate) enum DockerBackendError {
     #[error("Docker runtime is unavailable: {0}")]
     Docker(#[from] bollard::errors::Error),
+    #[error("Docker runtime discovery failed: {0}")]
+    Discovery(String),
     #[error("Docker startup preflight failed: {0}")]
     Preflight(String),
     #[error("Docker session reconciliation failed: {0}")]
@@ -490,27 +497,347 @@ enum AdoptionError {
     Transient(String),
 }
 
+async fn resolve_catalog_image_ids(
+    docker: &Docker,
+    catalog: &RuntimeCatalog,
+) -> Result<RuntimeCatalog, DockerBackendError> {
+    if catalog
+        .snapshots()
+        .all(|deployment| !deployment.image_id.is_empty())
+    {
+        return Ok(catalog.clone());
+    }
+    let mut image_ids = HashMap::new();
+    for deployment in catalog.snapshots() {
+        if image_ids.contains_key(&deployment.image) {
+            continue;
+        }
+        let inspection = docker
+            .inspect_image(&deployment.image)
+            .await
+            .map_err(|error| {
+                DockerBackendError::Preflight(format!(
+                    "runtime {} qualifier {} image {} is not present in the Docker daemon; build or load it before starting Flint: {error}",
+                    deployment.runtime_arn, deployment.qualifier, deployment.image
+                ))
+            })?;
+        let image_id =
+            immutable_image_reference(&inspection, &deployment.image).map_err(|message| {
+                DockerBackendError::Preflight(format!(
+                    "runtime {} qualifier {} image {} {message}",
+                    deployment.runtime_arn, deployment.qualifier, deployment.image
+                ))
+            })?;
+        let platform = image_platform(&inspection, &deployment.image)
+            .map_err(DockerBackendError::Preflight)?;
+        let image_config = inspection.config.as_ref();
+        image_ids.insert(
+            deployment.image.clone(),
+            ResolvedImage {
+                immutable_reference: image_id,
+                platform,
+                entrypoint: image_config.and_then(|config| config.entrypoint.clone()),
+                command: image_config.and_then(|config| config.cmd.clone()),
+                environment: image_config
+                    .and_then(|config| config.env.clone())
+                    .unwrap_or_default(),
+                working_directory: image_config
+                    .and_then(|config| config.working_dir.clone())
+                    .filter(|directory| !directory.is_empty()),
+            },
+        );
+    }
+    catalog
+        .with_resolved_image_ids(&image_ids)
+        .map_err(|error| DockerBackendError::Preflight(error.to_string()))
+}
+
+async fn discover_runtime_catalog(
+    docker: &Docker,
+    config: &DockerDiscoveryConfig,
+) -> Result<RuntimeCatalog, DockerBackendError> {
+    let mut candidates = HashMap::<String, DiscoveredRuntimeImage>::new();
+    if config.image_allowlist.is_empty() {
+        let images = docker
+            .list_images(Some(ListImagesOptionsBuilder::default().all(true).build()))
+            .await?;
+        for image in images {
+            if !image.labels.contains_key(RUNTIME_DESCRIPTOR_LABEL) {
+                continue;
+            }
+            let inspection = docker.inspect_image(&image.id).await.map_err(|error| {
+                DockerBackendError::Discovery(format!(
+                    "could not inspect marked image {}: {error}",
+                    image.id
+                ))
+            })?;
+            let mut references = inspection.repo_tags.clone().unwrap_or_default();
+            references.extend(inspection.repo_digests.clone().unwrap_or_default());
+            references.sort_unstable();
+            let Some(reference) = references.into_iter().next() else {
+                continue;
+            };
+            insert_discovered_image(&mut candidates, inspection, reference)?;
+        }
+    } else {
+        for reference in &config.image_allowlist {
+            let inspection = docker.inspect_image(reference).await.map_err(|error| {
+                DockerBackendError::Discovery(format!(
+                    "allowlisted image {reference} is not present in the Docker daemon: {error}"
+                ))
+            })?;
+            insert_discovered_image(&mut candidates, inspection, reference.clone())?;
+        }
+    }
+    let policy = DiscoveryPolicy {
+        connectivity: Connectivity {
+            mode: config.connectivity_mode,
+            docker_network: config.docker_network.clone(),
+            add_host_gateway: false,
+        },
+        environment_allowlist: config.environment_allowlist.clone(),
+        header_allowlist: config.header_allowlist.clone(),
+    };
+    RuntimeCatalog::from_discovered_images(candidates.into_values().collect(), &policy, |name| {
+        env::var(name).ok()
+    })
+    .map_err(|error| DockerBackendError::Discovery(error.to_string()))
+}
+
+fn insert_discovered_image(
+    candidates: &mut HashMap<String, DiscoveredRuntimeImage>,
+    inspection: bollard::models::ImageInspect,
+    image_reference: String,
+) -> Result<(), DockerBackendError> {
+    let content_id = inspection
+        .id
+        .clone()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DockerBackendError::Discovery(format!(
+                "marked image {image_reference} has no immutable image ID"
+            ))
+        })?;
+    let image_id = immutable_image_reference(&inspection, &image_reference)
+        .map_err(DockerBackendError::Discovery)?;
+    let image_platform =
+        image_platform(&inspection, &image_reference).map_err(DockerBackendError::Discovery)?;
+    let image_config = inspection.config.as_ref();
+    let image_entrypoint = image_config.and_then(|config| config.entrypoint.clone());
+    let image_command = image_config.and_then(|config| config.cmd.clone());
+    let image_environment = image_config
+        .and_then(|config| config.env.clone())
+        .unwrap_or_default();
+    let image_working_directory = image_config
+        .and_then(|config| config.working_dir.clone())
+        .filter(|directory| !directory.is_empty());
+    let descriptor_value = inspection
+        .config
+        .and_then(|config| config.labels)
+        .and_then(|labels| labels.get(RUNTIME_DESCRIPTOR_LABEL).cloned())
+        .ok_or_else(|| {
+            DockerBackendError::Discovery(format!(
+                "selected image {image_reference} has no {RUNTIME_DESCRIPTOR_LABEL} label"
+            ))
+        })?;
+    let descriptor = parse_runtime_descriptor(&descriptor_value).map_err(|error| {
+        DockerBackendError::Discovery(format!(
+            "image {image_reference} has an invalid {RUNTIME_DESCRIPTOR_LABEL} label: {error}"
+        ))
+    })?;
+    match candidates.entry(content_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(DiscoveredRuntimeImage {
+                image_id,
+                image_platform,
+                image_entrypoint,
+                image_command,
+                image_environment,
+                image_working_directory,
+                image_reference,
+                descriptor,
+            });
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if image_reference < entry.get().image_reference {
+                entry.get_mut().image_reference = image_reference;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn image_platform(
+    inspection: &bollard::models::ImageInspect,
+    image_reference: &str,
+) -> Result<String, String> {
+    match (
+        inspection.os.as_deref(),
+        inspection.architecture.as_deref(),
+        inspection.variant.as_deref(),
+    ) {
+        (Some(os), Some(architecture), Some(variant)) if !variant.is_empty() => {
+            Ok(format!("{os}/{architecture}/{variant}"))
+        }
+        (Some(os), Some(architecture), _) => Ok(format!("{os}/{architecture}")),
+        _ => Err(format!("image {image_reference} has no platform metadata")),
+    }
+}
+
+fn immutable_image_reference(
+    inspection: &bollard::models::ImageInspect,
+    image_reference: &str,
+) -> Result<String, String> {
+    let image_id = inspection
+        .id
+        .clone()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("image {image_reference} has no immutable image ID"))?;
+    let mut repo_digests = inspection.repo_digests.clone().unwrap_or_default();
+    repo_digests.sort_unstable();
+    Ok(repo_digests.into_iter().next().unwrap_or(image_id))
+}
+
+fn spawn_discovery_task(
+    docker: Docker,
+    catalog: RuntimeRegistry,
+    config: DockerDiscoveryConfig,
+) -> DiscoveryTask {
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        run_discovery_task(docker, catalog, config, task_cancellation).await;
+    });
+    DiscoveryTask { cancellation }
+}
+
+async fn run_discovery_task(
+    docker: Docker,
+    catalog: RuntimeRegistry,
+    config: DockerDiscoveryConfig,
+    cancellation: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(config.refresh_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+
+    loop {
+        let filters = HashMap::from([("type", vec!["image"])]);
+        let events = docker.events(Some(
+            EventsOptionsBuilder::default().filters(&filters).build(),
+        ));
+        tokio::pin!(events);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                _ = interval.tick() => {
+                    refresh_discovered_catalog(&docker, &catalog, &config).await;
+                }
+                event = events.next() => match event {
+                    Some(Ok(_)) => {
+                        tokio::select! {
+                            () = cancellation.cancelled() => return,
+                            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        }
+                        refresh_discovered_catalog(&docker, &catalog, &config).await;
+                    }
+                    Some(Err(error)) => {
+                        let message = format!("Docker image event stream failed: {error}");
+                        warn!(%error, "Docker runtime discovery event stream failed");
+                        catalog.mark_refresh_failure(message);
+                        break;
+                    }
+                    None => {
+                        catalog.mark_refresh_failure("Docker image event stream ended");
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            () = cancellation.cancelled() => return,
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+async fn refresh_discovered_catalog(
+    docker: &Docker,
+    catalog: &RuntimeRegistry,
+    config: &DockerDiscoveryConfig,
+) {
+    let result = match discover_runtime_catalog(docker, config).await {
+        Ok(discovered) => DockerSessionBackend::preflight_catalog(docker, &discovered)
+            .await
+            .map(|()| discovered),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(discovered) => catalog.replace(discovered),
+        Err(error) => {
+            warn!(%error, "Docker runtime discovery refresh is degraded");
+            catalog.mark_refresh_failure(error.to_string());
+        }
+    }
+}
+
+struct DiscoveryTask {
+    cancellation: CancellationToken,
+}
+
+impl Drop for DiscoveryTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DockerSessionBackend {
     docker: Docker,
     runtime_owner: String,
-    catalog: RuntimeCatalog,
-    catalog_generation: String,
+    catalog: RuntimeRegistry,
     client: reqwest::Client,
     adoptable: Arc<Mutex<HashMap<SessionKey, SessionContainer>>>,
     deployments: Arc<Mutex<HashMap<String, Arc<ResolvedRuntime>>>>,
     command_limits: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    discovery_task: Option<Arc<DiscoveryTask>>,
 }
 
 impl DockerSessionBackend {
+    #[cfg(test)]
     pub(crate) async fn connect(
         runtime_owner: String,
         catalog: RuntimeCatalog,
     ) -> Result<Self, DockerBackendError> {
-        let backend = Self {
-            docker: Docker::connect_with_local_defaults()?,
+        Self::connect_with_registry(runtime_owner, RuntimeRegistry::new(catalog), None).await
+    }
+
+    pub(crate) async fn connect_with_registry(
+        runtime_owner: String,
+        catalog: RuntimeRegistry,
+        discovery: Option<DockerDiscoveryConfig>,
+    ) -> Result<Self, DockerBackendError> {
+        let docker = Docker::connect_with_local_defaults()?;
+        docker.ping().await?;
+        match discovery.as_ref() {
+            Some(discovery) => match discover_runtime_catalog(&docker, discovery).await {
+                Ok(resolved) => {
+                    Self::preflight_catalog(&docker, &resolved).await?;
+                    catalog.replace(resolved);
+                }
+                Err(error) => {
+                    warn!(%error, "initial Docker runtime discovery failed");
+                    return Err(error);
+                }
+            },
+            None => {
+                let resolved = resolve_catalog_image_ids(&docker, &catalog.snapshot()).await?;
+                catalog.replace(resolved);
+            }
+        }
+        let mut backend = Self {
+            docker,
             runtime_owner,
-            catalog_generation: catalog.generation().to_owned(),
             catalog,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(1))
@@ -520,37 +847,55 @@ impl DockerSessionBackend {
             adoptable: Arc::new(Mutex::new(HashMap::new())),
             deployments: Arc::new(Mutex::new(HashMap::new())),
             command_limits: Arc::new(Mutex::new(HashMap::new())),
+            discovery_task: None,
         };
-        backend.docker.ping().await?;
         backend.preflight().await?;
         backend.reconcile().await?;
+        if let Some(discovery) = discovery {
+            backend.discovery_task = Some(Arc::new(spawn_discovery_task(
+                backend.docker.clone(),
+                backend.catalog.clone(),
+                discovery,
+            )));
+        }
         Ok(backend)
     }
 
     async fn preflight(&self) -> Result<(), DockerBackendError> {
-        let mut deployments = self.catalog.snapshots().collect::<Vec<_>>();
+        Self::preflight_catalog(&self.docker, &self.catalog.snapshot()).await
+    }
+
+    async fn preflight_catalog(
+        docker: &Docker,
+        catalog: &RuntimeCatalog,
+    ) -> Result<(), DockerBackendError> {
+        let mut deployments = catalog.snapshots().collect::<Vec<_>>();
         deployments.sort_by(|left, right| {
             (&left.runtime_arn, &left.qualifier).cmp(&(&right.runtime_arn, &right.qualifier))
         });
 
         let mut images = HashSet::new();
         for deployment in &deployments {
-            if !images.insert(deployment.image.clone()) {
+            if !images.insert(deployment.image_id.clone()) {
                 continue;
             }
-            let inspection = self
-                .docker
+            let inspection = docker
                 .inspect_image(&deployment.image)
                 .await
                 .map_err(|error| {
                     DockerBackendError::Preflight(format!(
-                        "runtime {} qualifier {} image {} is not present in the Docker daemon; build, load, or pull it before starting Flint: {error}",
-                        deployment.runtime_arn, deployment.qualifier, deployment.image
+                        "runtime {} qualifier {} image {} ({}) is not present in the Docker daemon; build or load it before starting Flint: {error}",
+                        deployment.runtime_arn,
+                        deployment.qualifier,
+                        deployment.image,
+                        deployment.image_id
                     ))
                 })?;
-            if inspection.id.as_deref().is_none_or(str::is_empty) {
+            let immutable = immutable_image_reference(&inspection, &deployment.image)
+                .map_err(DockerBackendError::Preflight)?;
+            if immutable != deployment.image_id {
                 return Err(DockerBackendError::Preflight(format!(
-                    "runtime {} qualifier {} image {} has no immutable image ID",
+                    "runtime {} qualifier {} image {} changed after discovery",
                     deployment.runtime_arn, deployment.qualifier, deployment.image
                 )));
             }
@@ -566,8 +911,7 @@ impl DockerSessionBackend {
                 .or_insert_with(|| Arc::clone(deployment));
         }
         for (network, deployment) in &networks {
-            let inspection = self
-                .docker
+            let inspection = docker
                 .inspect_network(network, None)
                 .await
                 .map_err(|error| {
@@ -598,8 +942,7 @@ impl DockerSessionBackend {
                             .to_owned(),
                     )
                 })?;
-            let inspection = self
-                .docker
+            let inspection = docker
                 .inspect_container(&container_id, None)
                 .await
                 .map_err(|error| {
@@ -690,11 +1033,6 @@ impl DockerSessionBackend {
             .as_ref()
             .and_then(|config| config.labels.as_ref())
             .ok_or_else(|| AdoptionError::Invalid("container has no labels".to_owned()))?;
-        if labels.get(CATALOG_GENERATION_LABEL) != Some(&self.catalog_generation) {
-            return Err(AdoptionError::Invalid(
-                "container belongs to another catalog generation".to_owned(),
-            ));
-        }
         let runtime_arn = labels
             .get(RUNTIME_LABEL)
             .ok_or_else(|| AdoptionError::Invalid("container has no runtime ARN".to_owned()))?;
@@ -706,23 +1044,21 @@ impl DockerSessionBackend {
         })?;
         let deployment = self
             .catalog
-            .resolve(runtime_arn, None, Some(qualifier))
+            .resolve_stored(runtime_arn, Some(qualifier))
             .map_err(|error| AdoptionError::Invalid(error.to_string()))?;
+        if labels.get(CATALOG_GENERATION_LABEL) != Some(&deployment.catalog_generation) {
+            return Err(AdoptionError::Invalid(
+                "container belongs to another catalog generation".to_owned(),
+            ));
+        }
         if labels.get(IMAGE_LABEL) != Some(&deployment.image) {
             return Err(AdoptionError::Invalid(
                 "container image does not match the catalog".to_owned(),
             ));
         }
-        let current_image_id = self
-            .docker
-            .inspect_image(&deployment.image)
-            .await
-            .map_err(|error| AdoptionError::Transient(format!("inspect catalog image: {error}")))?
-            .id
-            .ok_or_else(|| AdoptionError::Invalid("catalog image has no image ID".to_owned()))?;
-        if labels.get(IMAGE_ID_LABEL) != Some(&current_image_id) {
+        if labels.get(IMAGE_ID_LABEL) != Some(&deployment.image_id) {
             return Err(AdoptionError::Invalid(
-                "container uses a stale mutable image tag".to_owned(),
+                "container uses a different immutable image ID".to_owned(),
             ));
         }
         let endpoint =
@@ -812,23 +1148,16 @@ impl DockerSessionBackend {
         cancellation: CancellationToken,
     ) -> Result<SessionContainer, String> {
         let name = session_container_name(&self.runtime_owner, key);
-        let image_id = self
-            .docker
-            .inspect_image(&deployment.image)
-            .await
-            .map_err(|error| format!("inspect runtime image: {error}"))?
-            .id
-            .ok_or_else(|| "runtime image has no image ID".to_owned())?;
+        let image_id = deployment.image_id.clone();
+        let image_platform = deployment.image_platform.clone();
+        let catalog_generation = deployment.catalog_generation.clone();
         let mut labels = HashMap::from([
             (MANAGED_LABEL.to_owned(), "true".to_owned()),
             (OWNER_LABEL.to_owned(), self.runtime_owner.clone()),
             (RUNTIME_LABEL.to_owned(), key.runtime_arn.clone()),
             (QUALIFIER_LABEL.to_owned(), key.qualifier.clone()),
             (SESSION_LABEL.to_owned(), key.runtime_session_id.clone()),
-            (
-                CATALOG_GENERATION_LABEL.to_owned(),
-                self.catalog_generation.clone(),
-            ),
+            (CATALOG_GENERATION_LABEL.to_owned(), catalog_generation),
             (IMAGE_LABEL.to_owned(), deployment.image.clone()),
             (IMAGE_ID_LABEL.to_owned(), image_id),
             (
@@ -841,12 +1170,22 @@ impl DockerSessionBackend {
             ),
         ]);
         labels.shrink_to_fit();
-        let port = format!("{}/tcp", deployment.protocol_port);
+        for warning in &deployment.environment_warnings {
+            tracing::warn!(
+                runtime = %deployment.runtime_id,
+                image = %deployment.image,
+                "{warning}"
+            );
+        }
+        let port = format!("{}/tcp", deployment.protocol.port());
         let host_config = session_host_config(&deployment);
         let create_body = ContainerCreateBody {
-            image: Some(deployment.image.clone()),
+            image: Some(deployment.image_id.clone()),
             user: Some("10001:10001".to_owned()),
             env: Some(deployment.container_environment()),
+            entrypoint: deployment.image_entrypoint.clone(),
+            cmd: deployment.image_command.clone(),
+            working_dir: deployment.image_working_directory.clone(),
             labels: Some(labels),
             exposed_ports: Some(vec![port]),
             attach_stdin: Some(false),
@@ -859,7 +1198,12 @@ impl DockerSessionBackend {
         let created = self
             .docker
             .create_container(
-                Some(CreateContainerOptionsBuilder::default().name(&name).build()),
+                Some(
+                    CreateContainerOptionsBuilder::default()
+                        .name(&name)
+                        .platform(&image_platform)
+                        .build(),
+                ),
                 create_body,
             )
             .await
@@ -942,7 +1286,10 @@ impl DockerSessionBackend {
         struct PingResponse {
             status: String,
         }
-        let url = format!("{}{}", container.endpoint, deployment.ping_path);
+        let Some(ping_path) = deployment.protocol.ping_path() else {
+            return tcp_endpoint_health(&container.endpoint).await;
+        };
+        let url = format!("{}{ping_path}", container.endpoint);
         let Ok(response) = self.client.get(url).send().await else {
             return SessionHealth::Unhealthy;
         };
@@ -1266,13 +1613,34 @@ async fn run_detached_exec(
     Ok(())
 }
 
+async fn tcp_endpoint_health(endpoint: &str) -> SessionHealth {
+    let Ok(endpoint) = reqwest::Url::parse(endpoint) else {
+        return SessionHealth::Unhealthy;
+    };
+    let Some(host) = endpoint.host_str() else {
+        return SessionHealth::Unhealthy;
+    };
+    let Some(port) = endpoint.port_or_known_default() else {
+        return SessionHealth::Unhealthy;
+    };
+    match tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => SessionHealth::Healthy,
+        Ok(Err(_)) | Err(_) => SessionHealth::Unhealthy,
+    }
+}
+
 fn container_endpoint(
     inspection: &bollard::models::ContainerInspectResponse,
     deployment: &ResolvedRuntime,
 ) -> Result<String, String> {
     match deployment.connectivity.mode {
         ConnectivityMode::Native => {
-            let port = format!("{}/tcp", deployment.protocol_port);
+            let port = format!("{}/tcp", deployment.protocol.port());
             let host_port = inspection
                 .network_settings
                 .as_ref()
@@ -1292,7 +1660,7 @@ fn container_endpoint(
                 .map(|name| name.trim_start_matches('/'))
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| "runtime container has no network name".to_owned())?;
-            Ok(format!("http://{name}:{}", deployment.protocol_port))
+            Ok(format!("http://{name}:{}", deployment.protocol.port()))
         }
     }
 }
@@ -1327,7 +1695,7 @@ fn session_host_config(deployment: &ResolvedRuntime) -> HostConfig {
     let mut host_config = agent_host_config(deployment);
     if deployment.connectivity.mode == ConnectivityMode::Native {
         host_config.port_bindings = Some(HashMap::from([(
-            format!("{}/tcp", deployment.protocol_port),
+            format!("{}/tcp", deployment.protocol.port()),
             Some(vec![PortBinding {
                 host_ip: Some("127.0.0.1".to_owned()),
                 host_port: Some(String::new()),
@@ -1398,7 +1766,7 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use bollard::{
@@ -1408,19 +1776,37 @@ mod tests {
     };
 
     use crate::{
-        catalog::{ConnectivityMode, RuntimeCatalog},
-        config::RuntimeConfig,
-        session::{CommandEvent, SessionKey, SessionManager},
+        catalog::{ConnectivityMode, LocalIdentity, RuntimeCatalog, RuntimeRegistry},
+        config::{DockerDiscoveryConfig, RuntimeConfig},
+        session::{CommandEvent, SessionHealth, SessionKey, SessionManager},
     };
 
     use super::{
         CATALOG_GENERATION_LABEL, CREATED_AT_LABEL, DockerSessionBackend, IMAGE_ID_LABEL,
         IMAGE_LABEL, MANAGED_LABEL, OWNER_LABEL, QUALIFIER_LABEL, RUNTIME_LABEL, SESSION_LABEL,
-        agent_host_config, container_endpoint, is_owned_reconciliation_candidate,
-        session_container_name, session_host_config,
+        agent_host_config, container_endpoint, discover_runtime_catalog,
+        is_owned_reconciliation_candidate, refresh_discovered_catalog, resolve_catalog_image_ids,
+        session_container_name, session_host_config, tcp_endpoint_health,
     };
 
     const VALID_SESSION_LABEL: &str = "20000000-0000-0000-0000-000000000099";
+
+    #[tokio::test]
+    async fn mcp_tcp_health_checks_endpoint_reachability() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TCP listener");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        assert_eq!(tcp_endpoint_health(&endpoint).await, SessionHealth::Healthy);
+        drop(listener);
+        assert_eq!(
+            tcp_endpoint_health(&endpoint).await,
+            SessionHealth::Unhealthy
+        );
+    }
 
     #[test]
     fn reconciliation_ownership_requires_exact_managed_owner_and_session_labels() {
@@ -1452,7 +1838,9 @@ mod tests {
 
     #[test]
     fn native_agent_containers_disable_host_gateway_by_default() {
-        let deployment = RuntimeConfig::test_defaults().catalog.default_snapshot();
+        let deployment = RuntimeConfig::test_defaults()
+            .test_catalog()
+            .default_snapshot();
         let host_config = agent_host_config(&deployment);
 
         assert_eq!(host_config.network_mode, None);
@@ -1461,7 +1849,9 @@ mod tests {
 
     #[test]
     fn native_session_containers_publish_only_an_ephemeral_loopback_port() {
-        let snapshot = RuntimeConfig::test_defaults().catalog.default_snapshot();
+        let snapshot = RuntimeConfig::test_defaults()
+            .test_catalog()
+            .default_snapshot();
         let mut deployment = (*snapshot).clone();
         deployment.connectivity.mode = ConnectivityMode::Native;
         deployment.connectivity.docker_network = None;
@@ -1481,7 +1871,9 @@ mod tests {
 
     #[test]
     fn container_session_containers_use_the_configured_network_without_publishing_ports() {
-        let snapshot = RuntimeConfig::test_defaults().catalog.default_snapshot();
+        let snapshot = RuntimeConfig::test_defaults()
+            .test_catalog()
+            .default_snapshot();
         let mut deployment = (*snapshot).clone();
         deployment.connectivity.mode = ConnectivityMode::Container;
         deployment.connectivity.docker_network = Some("flint-agentcore".to_owned());
@@ -1517,6 +1909,137 @@ mod tests {
         assert!(first.len() <= 63);
     }
 
+    fn native_discovery_config(image: &str) -> DockerDiscoveryConfig {
+        DockerDiscoveryConfig {
+            image_allowlist: vec![image.to_owned()],
+            connectivity_mode: ConnectivityMode::Native,
+            docker_network: None,
+            refresh_interval: Duration::from_secs(30),
+            environment_allowlist: vec![
+                "FLINT_FIXTURE_ALLOWED".to_owned(),
+                "FLINT_FIXTURE_UNSET".to_owned(),
+            ],
+            header_allowlist: vec!["x-flint-invocation-id".to_owned()],
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Docker and the labeled flint-runtime-fixture image"]
+    async fn real_docker_discovery_resolves_the_labeled_fixture_immutably() {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let catalog = discover_runtime_catalog(
+            &docker,
+            &native_discovery_config("flint-runtime-fixture:local"),
+        )
+        .await
+        .expect("discover labeled fixture");
+        assert_eq!(catalog.len(), 1);
+        let identity = LocalIdentity {
+            region: "us-west-2".to_owned(),
+            account_id: "000000000000".to_owned(),
+        };
+        let deployment = catalog
+            .resolve(
+                "arn:aws:bedrock-agentcore:us-west-2:000000000000:runtime/flint_local",
+                None,
+                Some("DEFAULT"),
+                &identity,
+            )
+            .expect("resolve discovered fixture");
+        assert_eq!(deployment.image, "flint-runtime-fixture:local");
+        assert!(
+            deployment.image_id.contains("@sha256:") || deployment.image_id.starts_with("sha256:")
+        );
+        assert!(!deployment.image_platform.is_empty());
+        assert_eq!(
+            deployment.environment_value("FLINT_FIXTURE_ALLOWED"),
+            Some("fixture-allowed")
+        );
+        assert_eq!(
+            deployment.environment_value("FLINT_FIXTURE_UNAPPROVED"),
+            None
+        );
+        assert_eq!(deployment.environment_value("FLINT_FIXTURE_UNSET"), None);
+        assert_eq!(deployment.environment_warnings.len(), 2);
+        DockerSessionBackend::preflight_catalog(&docker, &catalog)
+            .await
+            .expect("preflight immutable discovery snapshot");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Docker and the labeled flint-runtime-fixture image"]
+    async fn real_docker_invalid_refresh_preserves_the_last_known_good_snapshot() {
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let catalog = discover_runtime_catalog(
+            &docker,
+            &native_discovery_config("flint-runtime-fixture:local"),
+        )
+        .await
+        .expect("discover labeled fixture");
+        let registry = RuntimeRegistry::new(catalog);
+        let last_known_good = registry.snapshot();
+
+        refresh_discovered_catalog(
+            &docker,
+            &registry,
+            &native_discovery_config("python:3.13-alpine"),
+        )
+        .await;
+
+        assert!(Arc::ptr_eq(&last_known_good, &registry.snapshot()));
+        assert_eq!(registry.health().discovery_status, "degraded");
+        assert!(registry.health().last_error.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Docker and the labeled flint-runtime-fixture image"]
+    async fn real_docker_initial_discovery_failure_preserves_owned_sessions() {
+        let owner = format!("agentcore-initial-discovery-test-{}", uuid::Uuid::new_v4());
+        let catalog = RuntimeCatalog::test_catalog();
+        let backend = DockerSessionBackend::connect(owner.clone(), catalog)
+            .await
+            .expect("connect session backend");
+        let deployment = backend.catalog.snapshot().default_snapshot();
+        let manager = SessionManager::new(Arc::new(backend.clone()));
+        let lease = manager
+            .acquire(Arc::clone(&deployment), VALID_SESSION_LABEL.to_owned())
+            .await
+            .expect("start owned session");
+        let container_id = lease.container.id.clone();
+        drop(lease);
+        drop(manager);
+        drop(backend);
+
+        let missing_image = format!("flint-missing-{}:local", uuid::Uuid::new_v4());
+        let error = match DockerSessionBackend::connect_with_registry(
+            owner,
+            RuntimeRegistry::new(RuntimeCatalog::empty_discovery()),
+            Some(native_discovery_config(&missing_image)),
+        )
+        .await
+        {
+            Ok(_) => panic!("missing initial discovery image unexpectedly started Flint"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(&missing_image));
+        assert!(
+            Docker::connect_with_local_defaults()
+                .expect("connect to Docker")
+                .inspect_container(&container_id, None)
+                .await
+                .is_ok(),
+            "initial discovery failure must leave owned sessions untouched"
+        );
+        Docker::connect_with_local_defaults()
+            .expect("connect to Docker")
+            .remove_container(
+                &container_id,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await
+            .expect("remove owned session container");
+    }
+
     #[tokio::test]
     #[ignore = "requires local Docker and the flint-runtime-fixture image"]
     async fn real_docker_preflight_rejects_a_missing_image() {
@@ -1532,7 +2055,7 @@ mod tests {
         };
         let message = error.to_string();
         assert!(message.contains(&image));
-        assert!(message.contains("build, load, or pull it before starting Flint"));
+        assert!(message.contains("build or load it before starting Flint"));
     }
 
     #[tokio::test]
@@ -1560,14 +2083,11 @@ mod tests {
         let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
         docker.ping().await.expect("ping Docker");
         let owner = format!("agentcore-transient-test-{}", uuid::Uuid::new_v4());
-        let catalog = RuntimeCatalog::test_catalog();
-        let deployment = catalog.default_snapshot();
-        let image_id = docker
-            .inspect_image(&deployment.image)
+        let catalog = resolve_catalog_image_ids(&docker, &RuntimeCatalog::test_catalog())
             .await
-            .expect("inspect fixture image")
-            .id
-            .expect("fixture image ID");
+            .expect("resolve fixture image");
+        let deployment = catalog.default_snapshot();
+        let image_id = deployment.image_id.clone();
         let labels = HashMap::from([
             (MANAGED_LABEL.to_owned(), "true".to_owned()),
             (OWNER_LABEL.to_owned(), owner.clone()),
@@ -1589,7 +2109,7 @@ mod tests {
                     .to_string(),
             ),
         ]);
-        let port = format!("{}/tcp", deployment.protocol_port);
+        let port = format!("{}/tcp", deployment.protocol.port());
         let name = format!("flint-transient-{}", uuid::Uuid::new_v4());
         let created = docker
             .create_container(
@@ -1718,11 +2238,17 @@ mod tests {
     #[ignore = "requires local Docker and the flint-runtime-fixture image"]
     async fn real_docker_session_is_ready_reused_adopted_executable_and_removed() {
         let owner = format!("agentcore-session-test-{}", uuid::Uuid::new_v4());
-        let catalog = RuntimeCatalog::test_catalog();
-        let deployment = catalog.default_snapshot();
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let catalog = discover_runtime_catalog(
+            &docker,
+            &native_discovery_config("flint-runtime-fixture:local"),
+        )
+        .await
+        .expect("discover labeled fixture");
         let backend = DockerSessionBackend::connect(owner.clone(), catalog.clone())
             .await
             .expect("connect session backend");
+        let deployment = backend.catalog.snapshot().default_snapshot();
         let manager = SessionManager::new(Arc::new(backend.clone()));
         let first = manager
             .acquire(Arc::clone(&deployment), VALID_SESSION_LABEL.to_owned())
@@ -1780,6 +2306,25 @@ mod tests {
             }
         }
         assert_eq!(stdout, b"persistent");
+
+        let mut environment = adopted_backend
+            .execute_command(
+                &adopted.container,
+                "printf '%s|%s|%s' \"${FLINT_FIXTURE_ALLOWED-unset}\" \"${FLINT_FIXTURE_UNAPPROVED-unset}\" \"${FLINT_FIXTURE_UNSET-unset}\"".to_owned(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("inspect forwarded environment");
+        let mut environment_stdout = Vec::new();
+        while let Some(event) = environment.recv().await {
+            match event.expect("environment event") {
+                CommandEvent::Stdout(chunk) => environment_stdout.extend(chunk),
+                CommandEvent::Exited(code) => assert_eq!(code, 0),
+                _ => {}
+            }
+        }
+        assert_eq!(environment_stdout, b"fixture-allowed|unset|unset");
         drop(adopted);
         adopted_manager
             .stop(

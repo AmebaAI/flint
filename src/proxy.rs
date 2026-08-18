@@ -56,12 +56,8 @@ impl RuntimeProxy {
     }
 
     pub(crate) async fn invoke(&self, request: ProxyRequest) -> Result<Response, ProxyError> {
-        self.forward(
-            reqwest::Method::POST,
-            request.deployment.invocation_path.clone(),
-            request,
-        )
-        .await
+        let path = request.deployment.protocol.invocation_path().to_owned();
+        self.forward(reqwest::Method::POST, path, request).await
     }
 
     pub(crate) async fn agent_card(
@@ -70,8 +66,9 @@ impl RuntimeProxy {
     ) -> Result<Response, ProxyError> {
         let path = request
             .deployment
-            .agent_card_path
-            .clone()
+            .protocol
+            .agent_card_path()
+            .map(str::to_owned)
             .ok_or(ProxyError::AgentCardNotConfigured)?;
         request.payload = ProxyPayload::Buffered(Bytes::new());
         self.forward(reqwest::Method::GET, path, request).await
@@ -413,6 +410,9 @@ mod tests {
             headers: parts.headers,
             body: body.clone(),
         });
+        if body == Bytes::from_static(b"slow-error") {
+            return slow_error().await;
+        }
         if body == Bytes::from_static(b"fail") {
             return Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -462,12 +462,10 @@ mod tests {
         (endpoint, recorded, server)
     }
 
-    fn deployment(protocol: Protocol, path: &str) -> Arc<ResolvedRuntime> {
+    fn deployment(protocol: Protocol, _path: &str) -> Arc<ResolvedRuntime> {
         let snapshot = RuntimeCatalog::test_catalog().default_snapshot();
         let mut deployment = (*snapshot).clone();
         deployment.protocol = protocol;
-        deployment.invocation_path = path.to_owned();
-        deployment.agent_card_path = Some("/.well-known/agent-card.json".to_owned());
         Arc::new(deployment)
     }
 
@@ -654,7 +652,7 @@ mod tests {
                     deployment: request_deployment,
                     lease,
                     headers: HeaderMap::new(),
-                    payload: ProxyPayload::Buffered(Bytes::new()),
+                    payload: ProxyPayload::Buffered(Bytes::from_static(b"slow-error")),
                     runtime_session_id: "slow-error-session".to_owned(),
                 })
                 .await
