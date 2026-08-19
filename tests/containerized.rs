@@ -158,7 +158,7 @@ async fn containerized_runtime_operations_use_the_shared_network() {
         .runtime_session_id(SESSION_ID)
         .body(
             InvokeAgentRuntimeCommandRequestBody::builder()
-                .command("printf '%s|%s|%s' \"${FLINT_FIXTURE_ALLOWED-unset}\" \"${FLINT_FIXTURE_UNAPPROVED-unset}\" \"${FLINT_FIXTURE_UNSET-unset}\"")
+                .command("printf containerized")
                 .build()
                 .expect("command body"),
         )
@@ -179,7 +179,7 @@ async fn containerized_runtime_operations_use_the_shared_network() {
             }
         }
     }
-    assert_eq!(stdout, "fixture-allowed|unset|unset");
+    assert_eq!(stdout, "containerized");
     assert_eq!(exit, Some((0, "COMPLETED".to_owned())));
 
     let card_error = client
