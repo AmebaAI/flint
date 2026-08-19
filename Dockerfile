@@ -1,13 +1,20 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.96.0-bookworm AS build
+FROM rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS build
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-RUN cargo build --locked --release --bin flint
+RUN mkdir src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && : > src/lib.rs \
+    && cargo build --locked --release --bin flint \
+    && rm -rf src
 
-FROM debian:bookworm-slim
+COPY src ./src
+RUN find src -type f -exec touch {} + \
+    && cargo build --locked --release --bin flint
+
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 ARG VERSION=0.0.0
 LABEL org.opencontainers.image.title="Flint" \
       org.opencontainers.image.vendor="Ameba" \
