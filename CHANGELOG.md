@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Distributed release images across native AMD64 and ARM64 runners, added
+  reusable Docker dependency and GitHub Actions caches, and removed redundant
+  verification builds.
+
 ### Deprecated
 
 ### Removed
@@ -18,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 ### Security
+
+- Pinned the release container build and runtime base images by digest.
 
 ## [0.1.0] - 2026-08-19
 

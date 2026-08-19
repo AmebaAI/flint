@@ -94,13 +94,10 @@ jobs:
       - name: Run containerized SDK verification
         run: mise run test:container
 
-      - name: Run CI image verification
-        run: mise run ci
-
       - name: Verify local publication task
         run: mise run publishLocal
 
-  publish-release:
+  prepare-release:
     if: >-
       (github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
@@ -109,11 +106,13 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'release/v')) ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     environment: release
-    permissions:
-      contents: write
-      packages: write
+    outputs:
+      image: ${{ steps.revision.outputs.image }}
+      minor: ${{ steps.revision.outputs.minor }}
+      sha: ${{ steps.revision.outputs.sha }}
+      version: ${{ steps.revision.outputs.version }}
     steps:
       - name: Select release revision
         id: revision
@@ -127,6 +126,7 @@ jobs:
           set -euo pipefail
           sha="$EVENT_SHA"
           version="${EVENT_VERSION#release/v}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/flint"
           if [ -n "$INPUT_SHA" ]; then sha="$INPUT_SHA"; fi
           if [ -n "$INPUT_VERSION" ]; then version="$INPUT_VERSION"; fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
@@ -136,6 +136,7 @@ jobs:
             [[ "$component" =~ ^(0|[1-9][0-9]*)$ ]]
           done
           {
+            printf 'image=%s\n' "$image"
             printf 'sha=%s\n' "$sha"
             printf 'version=%s\n' "$version"
             printf 'minor=%s.%s\n' "$major" "$minor"
@@ -200,18 +201,38 @@ jobs:
       - name: Run containerized SDK verification
         run: mise run test:container
 
-      - name: Run CI image verification
-        run: mise run ci
-
       - name: Verify local publication task
         run: mise run publishLocal
 
-      - name: Compute image name
-        id: image
-        shell: bash
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/flint"
-          echo "name=$image" >> "$GITHUB_OUTPUT"
+  build-release-image:
+    name: Build release image (${{ matrix.arch }})
+    needs: prepare-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ${{ needs.prepare-release.outputs.image }}
+      RELEASE_SHA: ${{ needs.prepare-release.outputs.sha }}
+      SOURCE: ${{ github.server_url }}/${{ github.repository }}
+      VERSION: ${{ needs.prepare-release.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare-release.outputs.sha }}
+          persist-credentials: false
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
@@ -220,47 +241,134 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - name: Set up Docker Buildx
+        uses: >-
+          docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+
+      - name: Prepare image output
+        id: output
+        shell: bash
+        run: |
+          value="type=image,name=$IMAGE"
+          value+=",push-by-digest=true"
+          value+=",name-canonical=true,push=true"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push platform image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: VERSION=${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.title=Flint
+            org.opencontainers.image.vendor=Ameba
+            org.opencontainers.image.licenses=GPL-3.0-only
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
+            org.opencontainers.image.source=${{ env.SOURCE }}
+          outputs: ${{ steps.output.outputs.value }}
+          cache-from: type=gha,scope=flint-release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=flint-release-${{ matrix.arch }}
+
+      - name: Export image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$DIGEST" != "${DIGEST#sha256:}"
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    needs: [prepare-release, build-release-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare-release.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download image digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: release-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: >-
-          docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+          docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
 
       - name: Generate image metadata
         id: metadata
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
-          images: ${{ steps.image.outputs.name }}
+          images: ${{ needs.prepare-release.outputs.image }}
           tags: |
-            type=raw,value=${{ steps.revision.outputs.version }}
-            type=raw,value=${{ steps.revision.outputs.minor }}
+            type=raw,value=${{ needs.prepare-release.outputs.version }}
+            type=raw,value=${{ needs.prepare-release.outputs.minor }}
             type=raw,value=latest
-          labels: |
-            org.opencontainers.image.title=Flint
-            org.opencontainers.image.vendor=Ameba
-            org.opencontainers.image.licenses=GPL-3.0-only
-            org.opencontainers.image.version={{version}}
-            org.opencontainers.image.revision=${{ steps.revision.outputs.sha }}
 
-      - name: Build and publish container
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha,scope=flint-release
-          cache-to: type=gha,mode=max,scope=flint-release
+      - name: Publish multi-platform image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.prepare-release.outputs.image }}
+          TAGS: ${{ steps.metadata.outputs.tags }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          digest_files=(/tmp/digests/*)
+          test "${#digest_files[@]}" -eq 2
+          sources=()
+          for file in "${digest_files[@]}"; do
+            sources+=("$IMAGE@sha256:${file##*/}")
+          done
+          tag_args=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then tag_args+=(--tag "$tag"); fi
+          done <<< "$TAGS"
+          test "${#tag_args[@]}" -gt 0
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          docker buildx imagetools inspect --raw "$IMAGE:$VERSION" |
+            jq -e '
+              [.manifests[].platform |
+                select(.os == "linux") |
+                "\(.os)/\(.architecture)"] |
+              sort == ["linux/amd64", "linux/arm64"]
+            '
 
       - name: Create or verify release tag
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_SHA: ${{ steps.revision.outputs.sha }}
-          VERSION: ${{ steps.revision.outputs.version }}
+          RELEASE_SHA: ${{ needs.prepare-release.outputs.sha }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           set -euo pipefail
           tag="v$VERSION"
@@ -278,7 +386,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.revision.outputs.version }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           set -euo pipefail
           awk -v version="$VERSION" '

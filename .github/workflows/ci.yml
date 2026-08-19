@@ -31,6 +31,8 @@ jobs:
     name: Docker integration
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      FLINT_BUILD_CACHE_SCOPE: flint-ci-docker-amd64
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -38,12 +40,13 @@ jobs:
           persist-credentials: false
       - name: Install toolchain
         uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518
+      - name: Set up Docker Buildx
+        uses: >-
+          docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
       - name: Run Docker lifecycle tests
         run: mise run test:docker
       - name: Run containerized SDK tests
         run: mise run test:container
-      - name: Build the verified local image
-        run: mise run ci
 
   dependencies:
     name: Dependency policy
@@ -63,6 +66,8 @@ jobs:
     name: Container security
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      FLINT_BUILD_CACHE_SCOPE: flint-ci-security-amd64
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -70,6 +75,9 @@ jobs:
           persist-credentials: false
       - name: Install toolchain
         uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518
+      - name: Set up Docker Buildx
+        uses: >-
+          docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
       - name: Build local image
         run: mise run publishLocal
       - name: Scan local image

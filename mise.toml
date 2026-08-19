@@ -35,7 +35,7 @@ run = "cargo run --bin flint"
 
 [tasks."docker:build"]
 description = "Build the local Flint container"
-run = "docker build --tag flint:local ."
+run = "if [ -n \"${FLINT_BUILD_CACHE_SCOPE:-}\" ]; then docker buildx build --load --tag flint:local --cache-from type=gha,scope=\"$FLINT_BUILD_CACHE_SCOPE\" --cache-to type=gha,mode=max,ignore-error=true,scope=\"$FLINT_BUILD_CACHE_SCOPE\" .; else docker build --tag flint:local .; fi"
 
 [tasks.publishLocal]
 description = "Build and publish Flint to the local Docker daemon as flint:local"
