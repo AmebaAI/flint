@@ -18,8 +18,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthorizationError, AuthorizationRequest, RuntimeIamAction, authorize},
-    catalog::{AuthenticationMode, CatalogError, ResolvedRuntime, RuntimeCatalog},
+    auth::{AuthorizationError, AuthorizationRequest, RuntimeIamAction, authorize, local_identity},
+    catalog::{
+        AuthenticationMode, CatalogError, LocalIdentity, ResolvedRuntime, RuntimeRegistry,
+        RuntimeRegistryHealth,
+    },
     command::event_stream_body,
     proxy::{ProxyError, ProxyPayload, ProxyRequest, RuntimeProxy},
     session::{SessionError, SessionManager},
@@ -43,7 +46,7 @@ const BAGGAGE_HEADER: &str = "baggage";
 
 #[derive(Clone)]
 pub(crate) struct RuntimeApiState {
-    catalog: RuntimeCatalog,
+    registry: RuntimeRegistry,
     sessions: SessionManager,
     proxy: Option<RuntimeProxy>,
     #[cfg(test)]
@@ -54,11 +57,11 @@ pub(crate) struct RuntimeApiState {
 
 impl RuntimeApiState {
     #[cfg(test)]
-    pub(crate) fn new(catalog: RuntimeCatalog, runtime: InvocationRuntime) -> Self {
+    pub(crate) fn new(registry: RuntimeRegistry, runtime: InvocationRuntime) -> Self {
         let sessions =
             SessionManager::new(Arc::new(InvocationSessionBackend::new(runtime.clone())));
         Self {
-            catalog,
+            registry,
             sessions,
             proxy: None,
             runtime: Some(runtime),
@@ -66,9 +69,9 @@ impl RuntimeApiState {
         }
     }
 
-    pub(crate) fn with_sessions(catalog: RuntimeCatalog, sessions: SessionManager) -> Self {
+    pub(crate) fn with_sessions(registry: RuntimeRegistry, sessions: SessionManager) -> Self {
         Self {
-            catalog,
+            registry,
             sessions,
             proxy: Some(RuntimeProxy::new()),
             #[cfg(test)]
@@ -81,6 +84,10 @@ impl RuntimeApiState {
     #[cfg(test)]
     pub(crate) fn runtime(&self) -> Option<&InvocationRuntime> {
         self.runtime.as_ref()
+    }
+
+    pub(crate) fn registry_health(&self) -> RuntimeRegistryHealth {
+        self.registry.health()
     }
 
     fn proxy(&self) -> Option<&RuntimeProxy> {
@@ -139,17 +146,19 @@ async fn invoke_agent_runtime(
     let query = query
         .map_err(|error| RuntimeApiError::validation(request_id.clone(), error.to_string()))?
         .0;
-    let deployment = resolve_runtime(
-        &state,
-        &runtime_identifier,
-        query.account_id.as_deref(),
-        query.qualifier.as_deref(),
-        &request_id,
-    )?;
     let (parts, body) = request.into_parts();
     validate_runtime_headers(&parts.headers, &request_id)?;
     let runtime_session_id = runtime_session_id(&parts.headers, true, &request_id)?
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let deployment = resolve_session_runtime(
+        &state,
+        &runtime_identifier,
+        query.account_id.as_deref(),
+        query.qualifier.as_deref(),
+        &runtime_session_id,
+        &parts.headers,
+        &request_id,
+    )?;
     if let Some(proxy) = state.proxy()
         && deployment.authentication.mode == AuthenticationMode::Permissive
         && !parts.headers.contains_key(header::AUTHORIZATION)
@@ -320,16 +329,18 @@ async fn invoke_agent_runtime_command(
     let query = query
         .map_err(|error| RuntimeApiError::validation(request_id.clone(), error.to_string()))?
         .0;
-    let deployment = resolve_runtime(
+    let (parts, body) = request.into_parts();
+    let runtime_session_id = runtime_session_id(&parts.headers, false, &request_id)?
+        .expect("required runtime session ID was validated");
+    let deployment = resolve_session_runtime(
         &state,
         &runtime_identifier,
         query.account_id.as_deref(),
         query.qualifier.as_deref(),
+        &runtime_session_id,
+        &parts.headers,
         &request_id,
     )?;
-    let (parts, body) = request.into_parts();
-    let runtime_session_id = runtime_session_id(&parts.headers, false, &request_id)?
-        .expect("required runtime session ID was validated");
     let payload = to_bytes(body, deployment.limits.max_request_bytes)
         .await
         .map_err(|_| {
@@ -416,16 +427,18 @@ async fn stop_runtime_session(
     let query = query
         .map_err(|error| RuntimeApiError::validation(request_id.clone(), error.to_string()))?
         .0;
-    let deployment = resolve_runtime(
+    let (parts, body) = request.into_parts();
+    let runtime_session_id = runtime_session_id(&parts.headers, false, &request_id)?
+        .expect("required runtime session ID was validated");
+    let deployment = resolve_session_runtime(
         &state,
         &runtime_identifier,
         query.account_id.as_deref(),
         query.qualifier.as_deref(),
+        &runtime_session_id,
+        &parts.headers,
         &request_id,
     )?;
-    let (parts, body) = request.into_parts();
-    let runtime_session_id = runtime_session_id(&parts.headers, false, &request_id)?
-        .expect("required runtime session ID was validated");
     let payload = to_bytes(body, deployment.limits.max_request_bytes)
         .await
         .map_err(|_| {
@@ -490,16 +503,18 @@ async fn get_agent_card(
     let query = query
         .map_err(|error| RuntimeApiError::validation(request_id.clone(), error.to_string()))?
         .0;
-    let deployment = resolve_runtime(
+    let (parts, _) = request.into_parts();
+    let runtime_session_id = runtime_session_id(&parts.headers, false, &request_id)?
+        .expect("required runtime session ID was validated");
+    let deployment = resolve_session_runtime(
         &state,
         &runtime_identifier,
         query.account_id.as_deref(),
         query.qualifier.as_deref(),
+        &runtime_session_id,
+        &parts.headers,
         &request_id,
     )?;
-    let (parts, _) = request.into_parts();
-    let runtime_session_id = runtime_session_id(&parts.headers, false, &request_id)?
-        .expect("required runtime session ID was validated");
     authorize_request(
         &deployment,
         &parts.method,
@@ -509,7 +524,7 @@ async fn get_agent_card(
         RuntimeIamAction::GetAgentCard,
         &request_id,
     )?;
-    if deployment.agent_card_path.is_none() {
+    if deployment.protocol.agent_card_path().is_none() {
         return Err(RuntimeApiError::runtime_client(
             request_id,
             "this runtime does not expose an A2A agent card",
@@ -584,19 +599,56 @@ fn authorize_request(
     })
 }
 
+fn resolve_session_runtime(
+    state: &RuntimeApiState,
+    runtime_identifier: &str,
+    account_id: Option<&str>,
+    qualifier: Option<&str>,
+    runtime_session_id: &str,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<Arc<ResolvedRuntime>, RuntimeApiError> {
+    let identity = local_identity(headers).map_err(|error| match error {
+        AuthorizationError::AccessDenied(message) => {
+            RuntimeApiError::access_denied(request_id.to_owned(), message)
+        }
+    })?;
+    if let Some(runtime) = state.sessions.pinned_runtime(
+        runtime_identifier,
+        account_id,
+        qualifier,
+        runtime_session_id,
+        &identity,
+    ) {
+        return Ok(runtime);
+    }
+    resolve_runtime(
+        state,
+        runtime_identifier,
+        account_id,
+        qualifier,
+        &identity,
+        request_id,
+    )
+}
+
 fn resolve_runtime(
     state: &RuntimeApiState,
     runtime_identifier: &str,
     account_id: Option<&str>,
     qualifier: Option<&str>,
+    identity: &LocalIdentity,
     request_id: &str,
 ) -> Result<Arc<ResolvedRuntime>, RuntimeApiError> {
     state
-        .catalog
-        .resolve(runtime_identifier, account_id, qualifier)
+        .registry
+        .resolve(runtime_identifier, account_id, qualifier, identity)
         .map_err(|error| match error {
             CatalogError::Resolution(message) if message.contains("accountId is required") => {
                 RuntimeApiError::validation(request_id.to_owned(), message)
+            }
+            CatalogError::IdentityMismatch(message) => {
+                RuntimeApiError::access_denied(request_id.to_owned(), message)
             }
             CatalogError::Resolution(message) => {
                 RuntimeApiError::resource_not_found(request_id.to_owned(), message)
@@ -1316,7 +1368,7 @@ mod tests {
         let invoke = |payload: &'static [u8]| {
             Request::builder()
                 .method("POST")
-                .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-west-2%3A000000000000%3Aruntime%2Fflint_local/invocations?qualifier=DEFAULT")
+                .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A000000000000%3Aruntime%2Fflint_local/invocations?qualifier=DEFAULT")
                 .header(RUNTIME_SESSION_ID_HEADER, SESSION_ID)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
                 .body(Body::from(payload))
@@ -1343,7 +1395,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-west-2%3A000000000000%3Aruntime%2Fflint_local/stopruntimesession?qualifier=DEFAULT")
+                    .uri("/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A000000000000%3Aruntime%2Fflint_local/stopruntimesession?qualifier=DEFAULT")
                     .header(RUNTIME_SESSION_ID_HEADER, SESSION_ID)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"clientToken":"10000000-0000-0000-0000-000000000001"}"#))

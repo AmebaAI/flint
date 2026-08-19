@@ -171,7 +171,7 @@ fn success_response() -> ResponseSpec {
 
 #[test]
 fn compatibility_target_is_pinned_and_runtime_scope_is_explicit() {
-    assert_eq!(aws_sdk_bedrockagentcore::meta::PKG_VERSION, "1.59.0");
+    assert_eq!(aws_sdk_bedrockagentcore::meta::PKG_VERSION, "1.60.0");
 
     let core = RUNTIME_OPERATION_SCOPE
         .iter()

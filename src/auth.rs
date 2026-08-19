@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::catalog::{
-    AuthenticationMode, AuthorizationPolicy, PolicyEffect, PolicyStatement, ResolvedCredential,
-    ResolvedRuntime,
+    AuthenticationMode, AuthorizationPolicy, DEFAULT_ACCOUNT_ID, LocalIdentity, PolicyEffect,
+    PolicyStatement, ResolvedCredential, ResolvedRuntime,
 };
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -53,6 +53,32 @@ pub(crate) struct AuthorizationRequest<'a> {
 pub(crate) struct AuthorizedPrincipal {
     #[allow(dead_code)]
     pub(crate) principal_arn: Option<String>,
+}
+
+pub(crate) fn local_identity(headers: &HeaderMap) -> Result<LocalIdentity, AuthorizationError> {
+    let Some(value) = headers.get(AUTHORIZATION_HEADER) else {
+        return Ok(LocalIdentity::default());
+    };
+    let authorization = parse_authorization(header_text(value, AUTHORIZATION_HEADER)?)?;
+    if authorization.service != SERVICE || authorization.terminator != TERMINATOR {
+        return Err(AuthorizationError::AccessDenied(
+            "credential scope has the wrong service or terminator".to_owned(),
+        ));
+    }
+    let account_id = if authorization.access_key_id.len() == 12
+        && authorization
+            .access_key_id
+            .bytes()
+            .all(|character| character.is_ascii_digit())
+    {
+        authorization.access_key_id
+    } else {
+        DEFAULT_ACCOUNT_ID.to_owned()
+    };
+    Ok(LocalIdentity {
+        region: authorization.region,
+        account_id,
+    })
 }
 
 pub(crate) fn authorize(
@@ -584,10 +610,46 @@ pub(crate) enum AuthorizationError {
 mod tests {
     use std::collections::HashMap;
 
+    use axum::http::{HeaderMap, HeaderValue, header};
+
     use super::{
-        RuntimeIamAction, conditions_match, evaluate_action, statement_matches, wildcard_match,
+        RuntimeIamAction, conditions_match, evaluate_action, local_identity, statement_matches,
+        wildcard_match,
     };
-    use crate::catalog::{AuthorizationPolicy, PolicyEffect, PolicyStatement};
+    use crate::catalog::{
+        AuthorizationPolicy, DEFAULT_ACCOUNT_ID, DEFAULT_REGION, PolicyEffect, PolicyStatement,
+    };
+
+    #[test]
+    fn local_identity_uses_floci_style_sigv4_context() {
+        let unsigned = local_identity(&HeaderMap::new()).expect("unsigned identity");
+        assert_eq!(unsigned.region, DEFAULT_REGION);
+        assert_eq!(unsigned.account_id, DEFAULT_ACCOUNT_ID);
+
+        let authorization = |access_key: &str, region: &str| {
+            HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential={access_key}/20260819/{region}/bedrock-agentcore/aws4_request, SignedHeaders=host;x-amz-date, Signature={}",
+                "0".repeat(64)
+            ))
+            .expect("authorization header")
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            authorization("123456789012", "eu-west-1"),
+        );
+        let multi_account = local_identity(&headers).expect("multi-account identity");
+        assert_eq!(multi_account.region, "eu-west-1");
+        assert_eq!(multi_account.account_id, "123456789012");
+
+        headers.insert(
+            header::AUTHORIZATION,
+            authorization("test", "ap-southeast-2"),
+        );
+        let default_account = local_identity(&headers).expect("default account identity");
+        assert_eq!(default_account.region, "ap-southeast-2");
+        assert_eq!(default_account.account_id, DEFAULT_ACCOUNT_ID);
+    }
 
     #[test]
     fn wildcard_matching_is_bounded_and_predictable() {

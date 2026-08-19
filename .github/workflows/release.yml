@@ -18,63 +18,99 @@ permissions:
   contents: read
 
 concurrency:
-  group: flint-release-${{ github.workflow }}-${{ github.ref }}
+  group: flint-release
   cancel-in-progress: false
 
 jobs:
   validate-release-pr:
     if: >-
       github.event_name == 'pull_request' &&
+      github.event.action != 'closed' &&
       startsWith(github.event.pull_request.head.ref, 'release/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Check out release revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: >-
-            ${{ github.event.pull_request.merge_commit_sha ||
-            github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
-      - name: Set up mise
-        uses: jdx/mise-action@v2
+      - name: Install toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518
         with:
           cache: false
 
       - name: Validate release metadata
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          test -f Cargo.toml
-          test -f Cargo.lock
-          test -f CHANGELOG.md
-          version=$(sed -n \
-            's/^version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
-          test -n "$version"
+          test "$PR_BASE" = "main"
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "flint") | .version')
+          IFS=. read -r major minor patch extra <<< "$version"
+          test -z "${extra:-}"
+          for component in "$major" "$minor" "$patch"; do
+            [[ "$component" =~ ^(0|[1-9][0-9]*)$ ]]
+          done
           test "$RELEASE_BRANCH" = "release/v$version"
           test "$PR_TITLE" = "Release Flint v$version"
-          grep -q "^## \[$version\] - " CHANGELOG.md
-          if grep -A8 -q '^## \[Unreleased\].*' CHANGELOG.md \
-            && grep -A8 -E '^## \[Unreleased\]' CHANGELOG.md \
-            | grep -q '^[-*]'; then
-            echo 'Unreleased must be empty in a release PR' >&2
+          grep -Eq "^## \[$version\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md
+          if awk '
+            /^## \[Unreleased\]/ { unreleased=1; next }
+            unreleased && /^## \[/ { exit }
+            unreleased && /^- / { found=1 }
+            END { exit found ? 0 : 1 }
+          ' CHANGELOG.md; then
+            echo 'Unreleased must contain no entries in a release PR' >&2
             exit 1
           fi
-          cargo metadata --no-deps --format-version 1 >/dev/null
+          latest=$(
+            gh api "repos/$GITHUB_REPOSITORY/tags" \
+              --paginate --jq '.[].name' |
+              sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' |
+              sort -V | tail -1
+          )
+          if [ -n "$latest" ]; then
+            greatest=$(
+              printf '%s\n%s\n' "$latest" "$version" |
+                sort -V | tail -1
+            )
+            test "$greatest" = "$version"
+            test "$latest" != "$version"
+          fi
 
-      - name: Run release checks
+      - name: Run ordinary verification
         run: mise run check
+
+      - name: Run Docker lifecycle verification
+        run: mise run test:docker
+
+      - name: Run containerized SDK verification
+        run: mise run test:container
+
+      - name: Run CI image verification
+        run: mise run ci
+
+      - name: Verify local publication task
+        run: mise run publishLocal
 
   publish-release:
     if: >-
       (github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
       startsWith(github.event.pull_request.head.ref, 'release/v')) ||
       github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: release
     permissions:
       contents: write
       packages: write
@@ -84,8 +120,8 @@ jobs:
         shell: bash
         env:
           EVENT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-          INPUT_SHA: ${{ inputs.commit }}
           EVENT_VERSION: ${{ github.event.pull_request.head.ref }}
+          INPUT_SHA: ${{ inputs.commit }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -93,81 +129,121 @@ jobs:
           version="${EVENT_VERSION#release/v}"
           if [ -n "$INPUT_SHA" ]; then sha="$INPUT_SHA"; fi
           if [ -n "$INPUT_VERSION" ]; then version="$INPUT_VERSION"; fi
-          case "$version" in
-            ''|*[!0-9.]*|.*|*.) echo 'Invalid release version' >&2; exit 1 ;;
-          esac
-          printf 'sha=%s\nversion=%s\n' "$sha" "$version" >> "$GITHUB_OUTPUT"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          IFS=. read -r major minor patch extra <<< "$version"
+          test -z "${extra:-}"
+          for component in "$major" "$minor" "$patch"; do
+            [[ "$component" =~ ^(0|[1-9][0-9]*)$ ]]
+          done
+          {
+            printf 'sha=%s\n' "$sha"
+            printf 'version=%s\n' "$version"
+            printf 'minor=%s.%s\n' "$major" "$minor"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check out merged release
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ steps.revision.outputs.sha }}
+          persist-credentials: false
 
-      - name: Set up mise
-        uses: jdx/mise-action@v2
+      - name: Install toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518
         with:
           cache: false
 
-      - name: Revalidate release contents
+      - name: Validate revision, version, and release order
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.revision.outputs.sha }}
           VERSION: ${{ steps.revision.outputs.version }}
         run: |
           set -euo pipefail
-          manifest_version=$(sed -n \
-            's/^version = "\([0-9][0-9.]*\)"/\1/p' Cargo.toml | head -1)
+          manifest_version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "flint") | .version')
           test "$manifest_version" = "$VERSION"
-          grep -q "^## \[$VERSION\] - " CHANGELOG.md
-          cargo metadata --no-deps --format-version 1 >/dev/null
-          mise run check
+          grep -Eq "^## \[$VERSION\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md
+          comparison=$(gh api \
+            "repos/$GITHUB_REPOSITORY/compare/$RELEASE_SHA...main" --jq .status)
+          case "$comparison" in
+            ahead|identical) ;;
+            *) echo 'Release commit is not reachable from main' >&2; exit 1 ;;
+          esac
+          latest=$(
+            gh api "repos/$GITHUB_REPOSITORY/tags" \
+              --paginate --jq '.[].name' |
+              sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' |
+              sort -V | tail -1
+          )
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" \
+            --jq .object.sha 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            test "$existing" = "$RELEASE_SHA"
+            test "$latest" = "$VERSION"
+          elif [ -n "$latest" ]; then
+            greatest=$(
+              printf '%s\n%s\n' "$latest" "$VERSION" |
+                sort -V | tail -1
+            )
+            test "$greatest" = "$VERSION"
+            test "$latest" != "$VERSION"
+          fi
+
+      - name: Run ordinary verification
+        run: mise run check
+
+      - name: Run Docker lifecycle verification
+        run: mise run test:docker
+
+      - name: Run containerized SDK verification
+        run: mise run test:container
+
+      - name: Run CI image verification
+        run: mise run ci
+
+      - name: Verify local publication task
+        run: mise run publishLocal
 
       - name: Compute image name
         id: image
+        shell: bash
         run: |
-          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/flint" \
-            >> "$GITHUB_OUTPUT"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/flint"
+          echo "name=$image" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Generate image tags
-        id: tags
-        env:
-          VERSION: ${{ steps.revision.outputs.version }}
-        run: |
-          {
-            echo 'value<<TAGS'
-            echo "type=raw,value=$VERSION"
-            echo "type=semver,pattern={{major}}.{{minor}},value=v$VERSION"
-            echo "type=semver,pattern={{major}},value=v$VERSION"
-            echo 'type=raw,value=latest'
-            echo 'TAGS'
-          } >> "$GITHUB_OUTPUT"
+        uses: >-
+          docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
       - name: Generate image metadata
         id: metadata
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
         with:
           images: ${{ steps.image.outputs.name }}
-          tags: ${{ steps.tags.outputs.value }}
+          tags: |
+            type=raw,value=${{ steps.revision.outputs.version }}
+            type=raw,value=${{ steps.revision.outputs.minor }}
+            type=raw,value=latest
           labels: |
             org.opencontainers.image.title=Flint
             org.opencontainers.image.vendor=Ameba
             org.opencontainers.image.licenses=GPL-3.0-only
+            org.opencontainers.image.version={{version}}
             org.opencontainers.image.revision=${{ steps.revision.outputs.sha }}
 
       - name: Build and publish container
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
           file: Dockerfile
@@ -182,19 +258,18 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.revision.outputs.version }}
           RELEASE_SHA: ${{ steps.revision.outputs.sha }}
+          VERSION: ${{ steps.revision.outputs.version }}
         run: |
           set -euo pipefail
           tag="v$VERSION"
-          ref_api="repos/$GITHUB_REPOSITORY/git/ref/tags/$tag"
-          existing=$(gh api "$ref_api" --jq .object.sha 2>/dev/null || true)
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
+            --jq .object.sha 2>/dev/null || true)
           if [ -n "$existing" ]; then
             test "$existing" = "$RELEASE_SHA"
           else
-            refs_api="repos/$GITHUB_REPOSITORY/git/refs"
-            gh api "$refs_api" -f ref="refs/tags/$tag" \
-              -f sha="$RELEASE_SHA" >/dev/null
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$RELEASE_SHA" >/dev/null
           fi
 
       - name: Create or update GitHub Release

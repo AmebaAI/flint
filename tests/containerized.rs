@@ -11,7 +11,7 @@ use bollard::{Docker, query_parameters::ListContainersOptionsBuilder};
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:35469";
 const DEFAULT_RUNTIME_ARN: &str =
     "arn:aws:bedrock-agentcore:us-west-2:000000000000:runtime/flint_local";
-const CONTAINER_QUALIFIER: &str = "CONTAINER";
+const CONTAINER_QUALIFIER: &str = "DEFAULT";
 const SESSION_ID: &str = "20000000-0000-0000-0000-000000000091";
 
 fn client() -> Client {
@@ -158,7 +158,7 @@ async fn containerized_runtime_operations_use_the_shared_network() {
         .runtime_session_id(SESSION_ID)
         .body(
             InvokeAgentRuntimeCommandRequestBody::builder()
-                .command("printf containerized")
+                .command("printf '%s|%s|%s' \"${FLINT_FIXTURE_ALLOWED-unset}\" \"${FLINT_FIXTURE_UNAPPROVED-unset}\" \"${FLINT_FIXTURE_UNSET-unset}\"")
                 .build()
                 .expect("command body"),
         )
@@ -179,18 +179,22 @@ async fn containerized_runtime_operations_use_the_shared_network() {
             }
         }
     }
-    assert_eq!(stdout, "containerized");
+    assert_eq!(stdout, "fixture-allowed|unset|unset");
     assert_eq!(exit, Some((0, "COMPLETED".to_owned())));
 
-    let card = client
+    let card_error = client
         .get_agent_card()
         .agent_runtime_arn(&runtime_arn)
         .qualifier(CONTAINER_QUALIFIER)
         .runtime_session_id(SESSION_ID)
         .send()
         .await
-        .expect("containerized agent card succeeds");
-    assert_eq!(card.status_code(), Some(200));
+        .expect_err("HTTP runtime has no A2A agent card");
+    assert!(
+        card_error
+            .as_service_error()
+            .is_some_and(|error| error.is_runtime_client_error())
+    );
 
     let stopped = client
         .stop_runtime_session()
