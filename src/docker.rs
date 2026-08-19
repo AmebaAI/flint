@@ -10,7 +10,10 @@ use bollard::{
     Docker,
     container::LogOutput,
     exec::{CreateExecOptions, StartExecOptions, StartExecResults},
-    models::{ContainerCreateBody, HostConfig, PortBinding},
+    models::{
+        ContainerCreateBody, HostConfig, Mount, MountTypeEnum, MountVolumeOptions, PortBinding,
+        VolumeCreateRequest,
+    },
     query_parameters::{
         CreateContainerOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder,
         ListImagesOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
@@ -800,6 +803,7 @@ pub(crate) struct DockerSessionBackend {
     adoptable: Arc<Mutex<HashMap<SessionKey, SessionContainer>>>,
     deployments: Arc<Mutex<HashMap<String, Arc<ResolvedRuntime>>>>,
     command_limits: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    session_storage_mount_path: String,
     discovery_task: Option<Arc<DiscoveryTask>>,
 }
 
@@ -809,13 +813,20 @@ impl DockerSessionBackend {
         runtime_owner: String,
         catalog: RuntimeCatalog,
     ) -> Result<Self, DockerBackendError> {
-        Self::connect_with_registry(runtime_owner, RuntimeRegistry::new(catalog), None).await
+        Self::connect_with_registry(
+            runtime_owner,
+            RuntimeRegistry::new(catalog),
+            None,
+            "/workspace".to_owned(),
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_registry(
         runtime_owner: String,
         catalog: RuntimeRegistry,
         discovery: Option<DockerDiscoveryConfig>,
+        session_storage_mount_path: String,
     ) -> Result<Self, DockerBackendError> {
         let docker = Docker::connect_with_local_defaults()?;
         docker.ping().await?;
@@ -847,6 +858,7 @@ impl DockerSessionBackend {
             adoptable: Arc::new(Mutex::new(HashMap::new())),
             deployments: Arc::new(Mutex::new(HashMap::new())),
             command_limits: Arc::new(Mutex::new(HashMap::new())),
+            session_storage_mount_path,
             discovery_task: None,
         };
         backend.preflight().await?;
@@ -1088,7 +1100,7 @@ impl DockerSessionBackend {
             }
         }
         if health == SessionHealth::Unhealthy {
-            return Err(AdoptionError::Transient(
+            return Err(AdoptionError::Invalid(
                 "container ping remained unhealthy during reconciliation".to_owned(),
             ));
         }
@@ -1141,6 +1153,39 @@ impl DockerSessionBackend {
             .map_err(|error| format!("clean prior runtime container: {error}"))
     }
 
+    async fn ensure_session_volume(&self, key: &SessionKey) -> Result<String, String> {
+        let name = session_volume_name(&self.runtime_owner, key);
+        let labels = HashMap::from([
+            (MANAGED_LABEL.to_owned(), "true".to_owned()),
+            (OWNER_LABEL.to_owned(), self.runtime_owner.clone()),
+            (RUNTIME_LABEL.to_owned(), key.runtime_arn.clone()),
+            (QUALIFIER_LABEL.to_owned(), key.qualifier.clone()),
+            (SESSION_LABEL.to_owned(), key.runtime_session_id.clone()),
+        ]);
+        let volume = match self.docker.inspect_volume(&name).await {
+            Ok(volume) => volume,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => self
+                .docker
+                .create_volume(VolumeCreateRequest {
+                    name: Some(name.clone()),
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| format!("create runtime session volume: {error}"))?,
+            Err(error) => return Err(format!("inspect runtime session volume: {error}")),
+        };
+        let owned = labels
+            .iter()
+            .all(|(label, value)| volume.labels.get(label) == Some(value));
+        if !owned {
+            return Err("runtime session volume name is occupied by another owner".to_owned());
+        }
+        Ok(name)
+    }
+
     async fn create(
         &self,
         key: &SessionKey,
@@ -1148,6 +1193,7 @@ impl DockerSessionBackend {
         cancellation: CancellationToken,
     ) -> Result<SessionContainer, String> {
         let name = session_container_name(&self.runtime_owner, key);
+        let volume_name = self.ensure_session_volume(key).await?;
         let image_id = deployment.image_id.clone();
         let image_platform = deployment.image_platform.clone();
         let catalog_generation = deployment.catalog_generation.clone();
@@ -1178,7 +1224,8 @@ impl DockerSessionBackend {
             );
         }
         let port = format!("{}/tcp", deployment.protocol.port());
-        let host_config = session_host_config(&deployment);
+        let host_config =
+            session_host_config(&deployment, &volume_name, &self.session_storage_mount_path);
         let create_body = ContainerCreateBody {
             image: Some(deployment.image_id.clone()),
             user: Some("10001:10001".to_owned()),
@@ -1282,25 +1329,10 @@ impl DockerSessionBackend {
         container: &SessionContainer,
         deployment: &ResolvedRuntime,
     ) -> SessionHealth {
-        #[derive(Deserialize)]
-        struct PingResponse {
-            status: String,
-        }
         let Some(ping_path) = deployment.protocol.ping_path() else {
             return tcp_endpoint_health(&container.endpoint).await;
         };
-        let url = format!("{}{ping_path}", container.endpoint);
-        let Ok(response) = self.client.get(url).send().await else {
-            return SessionHealth::Unhealthy;
-        };
-        if !response.status().is_success() {
-            return SessionHealth::Unhealthy;
-        }
-        match response.json::<PingResponse>().await {
-            Ok(response) if response.status == "Healthy" => SessionHealth::Healthy,
-            Ok(response) if response.status == "HealthyBusy" => SessionHealth::HealthyBusy,
-            _ => SessionHealth::Unhealthy,
-        }
+        http_endpoint_health(&self.client, &format!("{}{ping_path}", container.endpoint)).await
     }
 
     pub(crate) async fn execute_command(
@@ -1334,7 +1366,11 @@ impl DockerSessionBackend {
                 return Err("runtime command was cancelled while queued".to_owned());
             }
         };
-        let pid_file = format!("/workspace/.agentcore-command-{}.pid", uuid::Uuid::new_v4());
+        let pid_file = format!(
+            "{}/.agentcore-command-{}.pid",
+            self.session_storage_mount_path.trim_end_matches('/'),
+            uuid::Uuid::new_v4()
+        );
         let mut configured_command = deployment.command.shell.clone();
         configured_command.push(command);
         let mut command_line = vec![
@@ -1352,7 +1388,7 @@ impl DockerSessionBackend {
                 attach_stderr: Some(true),
                 cmd: Some(command_line),
                 user: Some("10001:10001".to_owned()),
-                working_dir: Some("/workspace".to_owned()),
+                working_dir: Some(self.session_storage_mount_path.clone()),
                 ..Default::default()
             },
         );
@@ -1488,6 +1524,10 @@ impl DockerSessionBackend {
 
 #[async_trait]
 impl SessionBackend for DockerSessionBackend {
+    fn volume_name(&self, key: &SessionKey) -> String {
+        session_volume_name(&self.runtime_owner, key)
+    }
+
     async fn start(
         &self,
         key: &SessionKey,
@@ -1613,6 +1653,25 @@ async fn run_detached_exec(
     Ok(())
 }
 
+async fn http_endpoint_health(client: &reqwest::Client, endpoint: &str) -> SessionHealth {
+    #[derive(Deserialize)]
+    struct PingResponse {
+        status: String,
+    }
+
+    let Ok(response) = client.get(endpoint).send().await else {
+        return SessionHealth::Unhealthy;
+    };
+    if !response.status().is_success() {
+        return SessionHealth::Unhealthy;
+    }
+    match response.json::<PingResponse>().await {
+        Ok(response) if response.status == "Healthy" => SessionHealth::Healthy,
+        Ok(response) if response.status == "HealthyBusy" => SessionHealth::HealthyBusy,
+        _ => SessionHealth::Unhealthy,
+    }
+}
+
 async fn tcp_endpoint_health(endpoint: &str) -> SessionHealth {
     let Ok(endpoint) = reqwest::Url::parse(endpoint) else {
         return SessionHealth::Unhealthy;
@@ -1683,16 +1742,51 @@ fn valid_runtime_session_label(value: &str) -> bool {
         })
 }
 
-fn session_container_name(runtime_owner: &str, key: &SessionKey) -> String {
+fn session_key_digest(runtime_owner: &str, key: &SessionKey) -> String {
     let digest = Sha256::digest(format!(
         "{runtime_owner}:{}:{}:{}",
         key.runtime_arn, key.qualifier, key.runtime_session_id
     ));
-    format!("agentcore-session-{}", &hex::encode(digest)[..24])
+    hex::encode(digest)[..24].to_owned()
 }
 
-fn session_host_config(deployment: &ResolvedRuntime) -> HostConfig {
+fn session_container_name(runtime_owner: &str, key: &SessionKey) -> String {
+    format!(
+        "agentcore-session-{}",
+        session_key_digest(runtime_owner, key)
+    )
+}
+
+fn session_volume_name(runtime_owner: &str, key: &SessionKey) -> String {
+    format!(
+        "agentcore-session-data-{}",
+        session_key_digest(runtime_owner, key)
+    )
+}
+
+fn session_host_config(
+    deployment: &ResolvedRuntime,
+    volume_name: &str,
+    mount_path: &str,
+) -> HostConfig {
     let mut host_config = agent_host_config(deployment);
+    if let Some(tmpfs) = host_config.tmpfs.as_mut() {
+        tmpfs.remove(mount_path);
+        if tmpfs.is_empty() {
+            host_config.tmpfs = None;
+        }
+    }
+    host_config.mounts = Some(vec![Mount {
+        target: Some(mount_path.to_owned()),
+        source: Some(volume_name.to_owned()),
+        typ: Some(MountTypeEnum::VOLUME),
+        read_only: Some(false),
+        volume_options: Some(MountVolumeOptions {
+            no_copy: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }]);
     if deployment.connectivity.mode == ConnectivityMode::Native {
         host_config.port_bindings = Some(HashMap::from([(
             format!("{}/tcp", deployment.protocol.port()),
@@ -1769,10 +1863,14 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use axum::{Json, Router, http::StatusCode, routing::get};
     use bollard::{
         Docker,
         models::ContainerCreateBody,
-        query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder},
+        query_parameters::{
+            CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
+            RemoveVolumeOptionsBuilder,
+        },
     };
 
     use crate::{
@@ -1784,9 +1882,9 @@ mod tests {
     use super::{
         CATALOG_GENERATION_LABEL, CREATED_AT_LABEL, DockerSessionBackend, IMAGE_ID_LABEL,
         IMAGE_LABEL, MANAGED_LABEL, OWNER_LABEL, QUALIFIER_LABEL, RUNTIME_LABEL, SESSION_LABEL,
-        agent_host_config, container_endpoint, discover_runtime_catalog,
+        agent_host_config, container_endpoint, discover_runtime_catalog, http_endpoint_health,
         is_owned_reconciliation_candidate, refresh_discovered_catalog, resolve_catalog_image_ids,
-        session_container_name, session_host_config, tcp_endpoint_health,
+        session_container_name, session_host_config, session_volume_name, tcp_endpoint_health,
     };
 
     const VALID_SESSION_LABEL: &str = "20000000-0000-0000-0000-000000000099";
@@ -1806,6 +1904,54 @@ mod tests {
             tcp_endpoint_health(&endpoint).await,
             SessionHealth::Unhealthy
         );
+    }
+
+    #[tokio::test]
+    async fn http_health_requires_a_successful_supported_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("health listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("health address"));
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/healthy",
+                        get(|| async { Json(serde_json::json!({"status":"Healthy"})) }),
+                    )
+                    .route(
+                        "/busy",
+                        get(|| async { Json(serde_json::json!({"status":"HealthyBusy"})) }),
+                    )
+                    .route("/missing", get(|| async { Json(serde_json::json!({})) }))
+                    .route("/invalid", get(|| async { "not-json" }))
+                    .route(
+                        "/error",
+                        get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    ),
+            )
+            .await
+            .expect("serve health fixture");
+        });
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            http_endpoint_health(&client, &format!("{endpoint}/healthy")).await,
+            SessionHealth::Healthy
+        );
+        assert_eq!(
+            http_endpoint_health(&client, &format!("{endpoint}/busy")).await,
+            SessionHealth::HealthyBusy
+        );
+        for path in ["missing", "invalid", "error", "absent"] {
+            assert_eq!(
+                http_endpoint_health(&client, &format!("{endpoint}/{path}")).await,
+                SessionHealth::Unhealthy,
+                "{path} must be unhealthy"
+            );
+        }
+        server.abort();
     }
 
     #[test]
@@ -1855,7 +2001,24 @@ mod tests {
         let mut deployment = (*snapshot).clone();
         deployment.connectivity.mode = ConnectivityMode::Native;
         deployment.connectivity.docker_network = None;
-        let host_config = session_host_config(&deployment);
+        let host_config = session_host_config(&deployment, "fixture-volume", "/workspace");
+        assert_eq!(host_config.tmpfs, None);
+        let mount = host_config
+            .mounts
+            .as_ref()
+            .and_then(|mounts| mounts.first())
+            .expect("persistent session mount");
+        assert_eq!(mount.source.as_deref(), Some("fixture-volume"));
+        assert_eq!(mount.target.as_deref(), Some("/workspace"));
+        assert_eq!(mount.typ, Some(bollard::models::MountTypeEnum::VOLUME));
+        assert_eq!(mount.read_only, Some(false));
+        assert_eq!(
+            mount
+                .volume_options
+                .as_ref()
+                .and_then(|options| options.no_copy),
+            Some(false)
+        );
         let bindings = host_config
             .port_bindings
             .expect("native session publishes its protocol port");
@@ -1879,7 +2042,7 @@ mod tests {
         deployment.connectivity.docker_network = Some("flint-agentcore".to_owned());
         deployment.connectivity.add_host_gateway = false;
 
-        let host_config = session_host_config(&deployment);
+        let host_config = session_host_config(&deployment, "fixture-volume", "/workspace");
         assert_eq!(host_config.network_mode.as_deref(), Some("flint-agentcore"));
         assert_eq!(host_config.port_bindings, None);
         assert_eq!(host_config.extra_hosts, None);
@@ -1903,10 +2066,14 @@ mod tests {
         };
         let first = session_container_name("owner-a", &key);
         assert_eq!(first, session_container_name("owner-a", &key));
+        let volume = session_volume_name("owner-a", &key);
+        assert_eq!(volume, session_volume_name("owner-a", &key));
         let mut other = key;
         other.runtime_session_id = "session-b".to_owned();
         assert_ne!(first, session_container_name("owner-a", &other));
+        assert_ne!(volume, session_volume_name("owner-a", &other));
         assert!(first.len() <= 63);
+        assert!(volume.len() <= 63);
     }
 
     fn native_discovery_config(image: &str) -> DockerDiscoveryConfig {
@@ -2012,9 +2179,10 @@ mod tests {
 
         let missing_image = format!("flint-missing-{}:local", uuid::Uuid::new_v4());
         let error = match DockerSessionBackend::connect_with_registry(
-            owner,
+            owner.clone(),
             RuntimeRegistry::new(RuntimeCatalog::empty_discovery()),
             Some(native_discovery_config(&missing_image)),
+            "/workspace".to_owned(),
         )
         .await
         {
@@ -2030,14 +2198,26 @@ mod tests {
                 .is_ok(),
             "initial discovery failure must leave owned sessions untouched"
         );
-        Docker::connect_with_local_defaults()
-            .expect("connect to Docker")
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        docker
             .remove_container(
                 &container_id,
                 Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await
             .expect("remove owned session container");
+        let key = SessionKey {
+            runtime_arn: deployment.runtime_arn.clone(),
+            qualifier: deployment.qualifier.clone(),
+            runtime_session_id: VALID_SESSION_LABEL.to_owned(),
+        };
+        docker
+            .remove_volume(
+                &session_volume_name(&owner, &key),
+                Some(RemoveVolumeOptionsBuilder::default().force(true).build()),
+            )
+            .await
+            .expect("remove owned session volume");
     }
 
     #[tokio::test]
@@ -2056,6 +2236,53 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains(&image));
         assert!(message.contains("build or load it before starting Flint"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Docker and the flint-runtime-fixture image"]
+    async fn real_docker_rejects_mismatched_session_volume_ownership() {
+        let owner = format!("agentcore-volume-test-{}", uuid::Uuid::new_v4());
+        let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
+        let backend = DockerSessionBackend::connect(owner.clone(), RuntimeCatalog::test_catalog())
+            .await
+            .expect("connect session backend");
+        let deployment = backend.catalog.snapshot().default_snapshot();
+        let key = SessionKey {
+            runtime_arn: deployment.runtime_arn.clone(),
+            qualifier: deployment.qualifier.clone(),
+            runtime_session_id: VALID_SESSION_LABEL.to_owned(),
+        };
+        let volume_name = session_volume_name(&owner, &key);
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(volume_name.clone()),
+                labels: Some(HashMap::from([
+                    (MANAGED_LABEL.to_owned(), "true".to_owned()),
+                    (OWNER_LABEL.to_owned(), "another-owner".to_owned()),
+                ])),
+                ..Default::default()
+            })
+            .await
+            .expect("create mismatched volume");
+        let manager = SessionManager::new(Arc::new(backend));
+
+        let error = match manager
+            .acquire(deployment, VALID_SESSION_LABEL.to_owned())
+            .await
+        {
+            Ok(_) => panic!("mismatched volume unexpectedly provisioned compute"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("another owner"));
+        assert!(docker.inspect_volume(&volume_name).await.is_ok());
+        docker
+            .remove_volume(
+                &volume_name,
+                Some(RemoveVolumeOptionsBuilder::default().force(true).build()),
+            )
+            .await
+            .expect("remove mismatched test volume");
     }
 
     #[tokio::test]
@@ -2079,7 +2306,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires local Docker and the flint-runtime-fixture image"]
-    async fn real_docker_reconciliation_preserves_owned_containers_on_transient_failure() {
+    async fn real_docker_reconciliation_removes_owned_unhealthy_containers() {
         let docker = Docker::connect_with_local_defaults().expect("connect to Docker");
         docker.ping().await.expect("ping Docker");
         let owner = format!("agentcore-transient-test-{}", uuid::Uuid::new_v4());
@@ -2120,7 +2347,11 @@ mod tests {
                     cmd: Some(vec!["sleep 60".to_owned()]),
                     labels: Some(labels),
                     exposed_ports: Some(vec![port]),
-                    host_config: Some(session_host_config(&deployment)),
+                    host_config: Some(session_host_config(
+                        &deployment,
+                        "fixture-volume",
+                        "/workspace",
+                    )),
                     ..Default::default()
                 },
             )
@@ -2134,19 +2365,10 @@ mod tests {
             .await
             .expect("start unhealthy owned container");
 
-        let error = match DockerSessionBackend::connect(owner, catalog).await {
-            Ok(_) => panic!("unhealthy owned container was unexpectedly adopted"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("it was left untouched"));
-        assert!(docker.inspect_container(&created.id, None).await.is_ok());
-        docker
-            .remove_container(
-                &created.id,
-                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-            )
+        DockerSessionBackend::connect(owner, catalog)
             .await
-            .expect("remove unhealthy owned container");
+            .expect("reconcile unhealthy owned container");
+        assert!(docker.inspect_container(&created.id, None).await.is_err());
     }
 
     #[tokio::test]
@@ -2264,7 +2486,7 @@ mod tests {
         drop(reused);
         drop(manager);
 
-        let adopted_backend = DockerSessionBackend::connect(owner, catalog)
+        let adopted_backend = DockerSessionBackend::connect(owner.clone(), catalog)
             .await
             .expect("reconcile session backend");
         let adopted_manager = SessionManager::new(Arc::new(adopted_backend.clone()));
@@ -2326,6 +2548,36 @@ mod tests {
         }
         assert_eq!(environment_stdout, b"fixture-allowed|unset|unset");
         drop(adopted);
+        adopted_backend
+            .docker
+            .kill_container(&container_id, None)
+            .await
+            .expect("kill adopted session container");
+        let replacement = adopted_manager
+            .acquire(Arc::clone(&deployment), VALID_SESSION_LABEL.to_owned())
+            .await
+            .expect("reprovision killed session");
+        let replacement_id = replacement.container.id.clone();
+        assert_ne!(replacement_id, container_id);
+        let mut persistent_read = adopted_backend
+            .execute_command(
+                &replacement.container,
+                "cat /workspace/session-marker".to_owned(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("read persistent marker from replacement");
+        let mut persistent_stdout = Vec::new();
+        while let Some(event) = persistent_read.recv().await {
+            match event.expect("persistent read event") {
+                CommandEvent::Stdout(chunk) => persistent_stdout.extend(chunk),
+                CommandEvent::Exited(code) => assert_eq!(code, 0),
+                _ => {}
+            }
+        }
+        assert_eq!(persistent_stdout, b"persistent");
+        drop(replacement);
         adopted_manager
             .stop(
                 &deployment,
@@ -2333,13 +2585,32 @@ mod tests {
                 Some("cleanup".to_owned()),
             )
             .await
-            .expect("remove session");
+            .expect("remove replacement compute");
         assert!(
             adopted_backend
                 .docker
-                .inspect_container(&container_id, None)
+                .inspect_container(&replacement_id, None)
                 .await
                 .is_err()
         );
+        let key = SessionKey {
+            runtime_arn: deployment.runtime_arn.clone(),
+            qualifier: deployment.qualifier.clone(),
+            runtime_session_id: VALID_SESSION_LABEL.to_owned(),
+        };
+        let volume_name = session_volume_name(&owner, &key);
+        adopted_backend
+            .docker
+            .inspect_volume(&volume_name)
+            .await
+            .expect("stopped logical session retains its volume");
+        adopted_backend
+            .docker
+            .remove_volume(
+                &volume_name,
+                Some(RemoveVolumeOptionsBuilder::default().force(true).build()),
+            )
+            .await
+            .expect("remove test session volume");
     }
 }

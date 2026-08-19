@@ -770,6 +770,13 @@ fn map_proxy_error(error: ProxyError, request_id: String) -> RuntimeApiError {
 
 fn map_session_error(error: SessionError, request_id: String) -> RuntimeApiError {
     match error {
+        SessionError::State(error) => {
+            tracing::error!(%error, "runtime session state operation failed");
+            RuntimeApiError::internal(request_id, "runtime session state is unavailable")
+        }
+        SessionError::DeploymentDrift(message) => {
+            RuntimeApiError::runtime_client(request_id, message, "session_deployment_drift")
+        }
         SessionError::RetryableConflict(message) => {
             RuntimeApiError::retryable_conflict(request_id, message, "session_state_conflict")
         }
@@ -981,7 +988,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
-    use super::RUNTIME_SESSION_ID_HEADER;
+    use super::{ERROR_TYPE_HEADER, RUNTIME_SESSION_ID_HEADER};
     use crate::{
         InvocationRuntime, ScaffoldContainerRuntime,
         catalog::{
@@ -989,6 +996,7 @@ mod tests {
         },
         runtime_router, runtime_router_with_sessions,
         session::{SessionBackend, SessionContainer, SessionHealth, SessionKey, SessionManager},
+        session_store::{SessionRecord, SessionStore, StoredSessionState},
     };
 
     const RUNTIME_ARN: &str =
@@ -1341,6 +1349,150 @@ mod tests {
             .header(header::CONTENT_TYPE, content_type)
             .body(Body::from(body))
             .expect("runtime response")
+    }
+
+    #[tokio::test]
+    async fn drifted_session_is_rejected_without_blocking_new_sessions() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("runtime fixture listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("runtime address"));
+        let runtime_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/invocations", post(echo_runtime)),
+            )
+            .await
+            .expect("serve runtime fixture");
+        });
+        let catalog = RuntimeCatalog::test_catalog();
+        let runtime = catalog.default_snapshot();
+        let key = SessionKey {
+            runtime_arn: runtime.runtime_arn.clone(),
+            qualifier: runtime.qualifier.clone(),
+            runtime_session_id: SESSION_ID.to_owned(),
+        };
+        let record = SessionRecord {
+            key,
+            catalog_generation: "stale-generation".to_owned(),
+            image: runtime.image.clone(),
+            image_id: "sha256:stale".to_owned(),
+            volume_name: "stale-session-volume".to_owned(),
+            created_at_unix_millis: 1,
+            last_activity_at_unix_millis: 1,
+            compute_started_at_unix_millis: None,
+            state: StoredSessionState::Stopped,
+            last_error: None,
+            last_stop_token: None,
+        };
+        let store = SessionStore::in_memory().expect("session store");
+        store.upsert(&record).expect("persist stale session");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let sessions = SessionManager::with_store(
+            Arc::new(ProxySessionBackend {
+                endpoint,
+                starts: Arc::clone(&starts),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+            store,
+            Duration::from_secs(5),
+        );
+        sessions
+            .restore_drifted(&record, "stored deployment pin is stale".to_owned())
+            .expect("quarantine stale session");
+        let app = runtime_router_with_sessions(catalog, sessions);
+
+        let drifted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runtimes/flint_local/invocations?accountId=000000000000")
+                    .header(RUNTIME_SESSION_ID_HEADER, SESSION_ID)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"prompt":"stale"}"#))
+                    .expect("drifted invocation request"),
+            )
+            .await
+            .expect("drifted invocation response");
+
+        assert_eq!(drifted.status(), StatusCode::from_u16(424).expect("424"));
+        assert_eq!(
+            drifted.headers().get(ERROR_TYPE_HEADER),
+            Some(&"RuntimeClientError".parse().expect("error type"))
+        );
+        let body = to_bytes(drifted.into_body(), 1024)
+            .await
+            .expect("drift response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("drift response JSON");
+        assert_eq!(body["code"], "session_deployment_drift");
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+        let fresh = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runtimes/flint_local/invocations?accountId=000000000000")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"prompt":"fresh"}"#))
+                    .expect("fresh invocation request"),
+            )
+            .await
+            .expect("fresh invocation response");
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        runtime_server.abort();
+    }
+
+    #[tokio::test]
+    async fn generated_session_id_is_returned_and_stored() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("runtime fixture listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("runtime address"));
+        let runtime_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/invocations", post(echo_runtime)),
+            )
+            .await
+            .expect("serve runtime fixture");
+        });
+        let store = SessionStore::in_memory().expect("session store");
+        let sessions = SessionManager::with_store(
+            Arc::new(ProxySessionBackend {
+                endpoint,
+                starts: Arc::new(AtomicUsize::new(0)),
+                stops: Arc::new(AtomicUsize::new(0)),
+            }),
+            store.clone(),
+            Duration::from_secs(5),
+        );
+        let app = runtime_router_with_sessions(RuntimeCatalog::test_catalog(), sessions);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/runtimes/flint_local/invocations?accountId=000000000000")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"prompt":"hello"}"#))
+                    .expect("invoke request"),
+            )
+            .await
+            .expect("invoke response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response
+            .headers()
+            .get(RUNTIME_SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("generated runtime session ID");
+        assert_eq!(session_id.len(), 36);
+        let records = store.load_all().expect("stored sessions");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key.runtime_session_id, session_id);
+        runtime_server.abort();
     }
 
     #[tokio::test]

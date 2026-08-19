@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 #[cfg(test)]
 use async_trait::async_trait;
@@ -16,7 +16,8 @@ use runtime::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use session::SessionManager;
+use session::{SessionBackend, SessionError, SessionManager};
+use session_store::SessionStore;
 #[cfg(test)]
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
@@ -32,6 +33,7 @@ mod proxy;
 #[cfg(test)]
 mod runtime;
 mod session;
+mod session_store;
 
 #[cfg(test)]
 mod tests;
@@ -55,7 +57,16 @@ pub async fn app() -> Result<Router, StartupError> {
 }
 
 async fn production_router(config: RuntimeConfig) -> Result<Router, StartupError> {
-    let (catalog, discovery) = match config.runtime_source {
+    let RuntimeConfig {
+        runtime_owner,
+        runtime_source,
+        state_path,
+        session_storage_mount_path,
+        health_check_interval,
+    } = config;
+    let store = SessionStore::open(&state_path)?;
+    tracing::info!(path = %store.path().display(), "opened runtime session state");
+    let (catalog, discovery) = match runtime_source {
         RuntimeSourceConfig::Catalog { catalog } => (catalog, None),
         RuntimeSourceConfig::Docker(discovery) => {
             tracing::info!(
@@ -68,9 +79,10 @@ async fn production_router(config: RuntimeConfig) -> Result<Router, StartupError
     let registry = RuntimeRegistry::new(catalog);
     let session_backend = Arc::new(
         DockerSessionBackend::connect_with_registry(
-            config.runtime_owner,
+            runtime_owner,
             registry.clone(),
             discovery,
+            session_storage_mount_path,
         )
         .await?,
     );
@@ -89,13 +101,81 @@ async fn production_router(config: RuntimeConfig) -> Result<Router, StartupError
             "started with an empty runtime registry"
         );
     }
-    let adopted = session_backend.take_adopted_sessions().await;
-    let sessions = SessionManager::new(session_backend);
-    for (key, deployment, container) in adopted {
+    let mut adopted = session_backend
+        .take_adopted_sessions()
+        .await
+        .into_iter()
+        .map(|(key, deployment, container)| (key, (deployment, container)))
+        .collect::<HashMap<_, _>>();
+    let records = store.load_all()?;
+    let sessions = SessionManager::with_store(
+        Arc::clone(&session_backend) as Arc<dyn SessionBackend>,
+        store,
+        health_check_interval,
+    );
+    for record in records {
+        let deployment = registry
+            .resolve_stored(&record.key.runtime_arn, Some(&record.key.qualifier))
+            .map_err(|error| {
+                format!(
+                    "stored runtime session {} cannot resolve its deployment pin: {error}",
+                    record.key.runtime_session_id
+                )
+            })
+            .and_then(|deployment| {
+                sessions
+                    .validate_record(&deployment, &record)
+                    .map(|()| deployment)
+                    .map_err(|error| match error {
+                        SessionError::DeploymentDrift(message) => message,
+                        error => error.to_string(),
+                    })
+            });
+        let deployment = match deployment {
+            Ok(deployment) => deployment,
+            Err(message) => {
+                tracing::warn!(
+                    runtime_session_id = %record.key.runtime_session_id,
+                    %message,
+                    "stored runtime session is blocked by deployment drift"
+                );
+                if let Some((_, container)) = adopted.remove(&record.key) {
+                    session_backend
+                        .stop(&container)
+                        .await
+                        .map_err(|error| StartupError {
+                            message: format!(
+                                "failed to remove drifted runtime session compute: {error}"
+                            ),
+                        })?;
+                }
+                sessions
+                    .restore_drifted(&record, message)
+                    .map_err(|error| StartupError {
+                        message: format!("failed to quarantine drifted runtime session: {error}"),
+                    })?;
+                continue;
+            }
+        };
+        if let Some((adopted_deployment, container)) = adopted.remove(&record.key) {
+            sessions
+                .adopt(adopted_deployment, record.key, container)
+                .map_err(|error| StartupError {
+                    message: format!("failed to adopt stored runtime session: {error}"),
+                })?;
+        } else {
+            sessions
+                .restore_stopped(deployment, &record)
+                .map_err(|error| StartupError {
+                    message: format!("failed to restore stopped runtime session: {error}"),
+                })?;
+        }
+    }
+    for (key, (deployment, container)) in adopted {
         sessions
             .adopt(deployment, key, container)
             .map_err(|error| StartupError {
-                message: format!("failed to adopt runtime session: {error}"),
+                message: format!("failed to adopt legacy runtime session: {error}"),
             })?;
     }
     Ok(runtime_router_with_registry(registry, sessions))
@@ -238,6 +318,14 @@ pub struct StartupError {
 
 impl From<config::ConfigError> for StartupError {
     fn from(error: config::ConfigError) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<session_store::SessionStoreError> for StartupError {
+    fn from(error: session_store::SessionStoreError) -> Self {
         Self {
             message: error.to_string(),
         }

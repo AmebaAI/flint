@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added Docker image-label runtime discovery with event-driven refresh,
   periodic resync, degraded health diagnostics, and last-known-good snapshots.
 - Added guarded multi-platform GHCR and GitHub Release automation.
+- Added SQLite-backed logical session state and persistent per-session Docker
+  volumes that survive compute replacement and Flint restarts.
 
 ### Changed
 
@@ -32,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixed HTTP, MCP, A2A, and AG-UI service contracts.
 - Derived local runtime identity from Floci-style SigV4 region and account
   context, with `us-east-1` and `000000000000` unsigned defaults.
+- Added steady-state runtime health polling. `HealthyBusy` preserves background
+  work, while idle, expired, or repeatedly unhealthy compute is stopped without
+  deleting the logical session.
+- Defaulted the Docker resource owner to `flint`; operators can still override
+  it with `AGENTCORE_RUNTIME_OWNER` when running multiple instances.
+- Updated the example runtime with a disk-backed invocation counter that
+  demonstrates session storage surviving compute replacement.
 
 ### Deprecated
 
@@ -41,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Initial Docker discovery failures now stop startup before reconciliation so
   existing owned session containers remain untouched.
+- Killed or otherwise unavailable session containers are replaced on the next
+  invocation instead of remaining cached as unavailable compute.
+- Persisted sessions with stale deployment pins now block only their own resume
+  instead of preventing Flint from starting with the current runtime catalog.
 
 ### Security
 

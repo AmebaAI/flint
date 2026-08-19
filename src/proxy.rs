@@ -180,7 +180,13 @@ impl RuntimeProxy {
                     Err(_) if request_limit_exceeded.load(Ordering::Acquire) => {
                         return Err(ProxyError::RequestLimit);
                     }
-                    Err(error) => return Err(ProxyError::Unavailable(error.to_string())),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if let Err(invalidation) = request.lease.invalidate().await {
+                            tracing::warn!(%invalidation, "failed to invalidate unavailable runtime compute");
+                        }
+                        return Err(ProxyError::Unavailable(message));
+                    }
                 }
             },
         };

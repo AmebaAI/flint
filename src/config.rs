@@ -1,4 +1,9 @@
-use std::{collections::HashSet, env, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    env,
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
 
 use thiserror::Error;
 
@@ -6,12 +11,19 @@ use crate::catalog::{Connectivity, ConnectivityMode, DiscoveryPolicy, RuntimeCat
 
 pub(crate) const DEFAULT_CATALOG_PATH: &str = "config/runtime-catalog.example.json";
 const DEFAULT_DISCOVERY_REFRESH_SECONDS: u64 = 30;
+const DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS: u64 = 5;
+const DEFAULT_RUNTIME_OWNER: &str = "flint";
+const DEFAULT_SESSION_STORAGE_MOUNT_PATH: &str = "/workspace";
 const MAX_DISCOVERY_REFRESH_SECONDS: u64 = 3_600;
+const MAX_HEALTH_CHECK_INTERVAL_SECONDS: u64 = 3_600;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeConfig {
     pub(crate) runtime_owner: String,
     pub(crate) runtime_source: RuntimeSourceConfig,
+    pub(crate) state_path: PathBuf,
+    pub(crate) session_storage_mount_path: String,
+    pub(crate) health_check_interval: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -40,8 +52,8 @@ impl RuntimeConfig {
     where
         F: Fn(&'static str) -> Result<Option<String>, ConfigError>,
     {
-        let runtime_owner = lookup("AGENTCORE_RUNTIME_OWNER")?
-            .ok_or(ConfigError::Missing("AGENTCORE_RUNTIME_OWNER"))?;
+        let runtime_owner =
+            lookup("AGENTCORE_RUNTIME_OWNER")?.unwrap_or_else(|| DEFAULT_RUNTIME_OWNER.to_owned());
         let source = lookup("AGENTCORE_RUNTIME_SOURCE")?.unwrap_or_else(|| "docker".to_owned());
         let configured_catalog = lookup("AGENTCORE_RUNTIME_CATALOG")?;
         let policy = runtime_policy_from_lookup(&lookup)?;
@@ -64,9 +76,26 @@ impl RuntimeConfig {
             }
             _ => return Err(ConfigError::Invalid("AGENTCORE_RUNTIME_SOURCE")),
         };
+        let state_path = state_path_from_lookup(&lookup)?;
+        let session_storage_mount_path = lookup("FLINT_SESSION_STORAGE_MOUNT_PATH")?
+            .unwrap_or_else(|| DEFAULT_SESSION_STORAGE_MOUNT_PATH.to_owned());
+        let health_check_interval = lookup("FLINT_HEALTH_CHECK_INTERVAL_SECONDS")?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|seconds| (1..=MAX_HEALTH_CHECK_INTERVAL_SECONDS).contains(seconds))
+                    .map(Duration::from_secs)
+                    .ok_or(ConfigError::Invalid("FLINT_HEALTH_CHECK_INTERVAL_SECONDS"))
+            })
+            .transpose()?
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS));
         let config = Self {
             runtime_owner,
             runtime_source,
+            state_path,
+            session_storage_mount_path,
+            health_check_interval,
         };
         config.validate()?;
         Ok(config)
@@ -79,6 +108,13 @@ impl RuntimeConfig {
             runtime_source: RuntimeSourceConfig::Catalog {
                 catalog: RuntimeCatalog::test_catalog(),
             },
+            state_path: env::temp_dir().join(format!(
+                "flint-test-{}-{}.sqlite3",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            )),
+            session_storage_mount_path: DEFAULT_SESSION_STORAGE_MOUNT_PATH.to_owned(),
+            health_check_interval: Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS),
         }
     }
 
@@ -94,8 +130,39 @@ impl RuntimeConfig {
         if self.runtime_owner.trim().is_empty() {
             return Err(ConfigError::Invalid("AGENTCORE_RUNTIME_OWNER"));
         }
+        if !self.state_path.is_absolute() {
+            return Err(ConfigError::Invalid("FLINT_STATE_PATH"));
+        }
+        if !valid_container_mount_path(&self.session_storage_mount_path) {
+            return Err(ConfigError::Invalid("FLINT_SESSION_STORAGE_MOUNT_PATH"));
+        }
         Ok(())
     }
+}
+
+fn state_path_from_lookup<F>(lookup: &F) -> Result<PathBuf, ConfigError>
+where
+    F: Fn(&'static str) -> Result<Option<String>, ConfigError>,
+{
+    if let Some(path) = lookup("FLINT_STATE_PATH")? {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = lookup("XDG_STATE_HOME")? {
+        return Ok(PathBuf::from(path).join("flint/flint.sqlite3"));
+    }
+    if let Some(home) = lookup("HOME")? {
+        return Ok(PathBuf::from(home).join(".local/state/flint/flint.sqlite3"));
+    }
+    Err(ConfigError::Missing("FLINT_STATE_PATH"))
+}
+
+fn valid_container_mount_path(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && path != Path::new("/")
+        && path
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
 }
 
 impl DockerDiscoveryConfig {
@@ -292,7 +359,52 @@ mod tests {
 
     fn config_from(values: &[(&str, &str)]) -> Result<RuntimeConfig, ConfigError> {
         let values = values.iter().copied().collect::<HashMap<_, _>>();
-        RuntimeConfig::from_lookup(|name| Ok(values.get(name).map(ToString::to_string)))
+        RuntimeConfig::from_lookup(|name| {
+            Ok(values
+                .get(name)
+                .map(ToString::to_string)
+                .or_else(|| (name == "HOME").then(|| "/tmp/flint-config-test".to_owned())))
+        })
+    }
+
+    #[test]
+    fn session_control_defaults_and_validates_overrides() {
+        let defaults = config_from(&[]).expect("default config");
+        assert_eq!(defaults.runtime_owner, "flint");
+        assert_eq!(
+            defaults.state_path,
+            std::path::Path::new("/tmp/flint-config-test/.local/state/flint/flint.sqlite3")
+        );
+        assert_eq!(defaults.session_storage_mount_path, "/workspace");
+        assert_eq!(defaults.health_check_interval.as_secs(), 5);
+
+        let configured = config_from(&[
+            ("AGENTCORE_RUNTIME_OWNER", "owner"),
+            ("FLINT_STATE_PATH", "/var/lib/flint/custom.sqlite3"),
+            ("FLINT_SESSION_STORAGE_MOUNT_PATH", "/mnt/session"),
+            ("FLINT_HEALTH_CHECK_INTERVAL_SECONDS", "10"),
+        ])
+        .expect("configured session control");
+        assert_eq!(
+            configured.state_path,
+            std::path::Path::new("/var/lib/flint/custom.sqlite3")
+        );
+        assert_eq!(configured.session_storage_mount_path, "/mnt/session");
+        assert_eq!(configured.health_check_interval.as_secs(), 10);
+
+        for (name, value) in [
+            ("FLINT_STATE_PATH", "relative.sqlite3"),
+            ("FLINT_SESSION_STORAGE_MOUNT_PATH", "workspace"),
+            ("FLINT_SESSION_STORAGE_MOUNT_PATH", "/"),
+            ("FLINT_SESSION_STORAGE_MOUNT_PATH", "/workspace/../other"),
+            ("FLINT_HEALTH_CHECK_INTERVAL_SECONDS", "0"),
+            ("FLINT_HEALTH_CHECK_INTERVAL_SECONDS", "3601"),
+        ] {
+            assert!(
+                config_from(&[("AGENTCORE_RUNTIME_OWNER", "owner"), (name, value)]).is_err(),
+                "{name}={value} must be rejected"
+            );
+        }
     }
 
     #[test]
