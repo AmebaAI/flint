@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.1.0] - 2026-08-19
+
+### Added
+
 - Migrated the standalone AgentCore Runtime emulator into the Flint Rust package.
 - Added deterministic runtime fixture, native Docker lifecycle tests, and
   containerized SDK coverage.
@@ -41,10 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it with `AGENTCORE_RUNTIME_OWNER` when running multiple instances.
 - Updated the example runtime with a disk-backed invocation counter that
   demonstrates session storage surviving compute replacement.
-
-### Deprecated
-
-### Removed
 
 ### Fixed
 
