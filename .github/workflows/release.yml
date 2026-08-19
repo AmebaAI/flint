@@ -176,8 +176,9 @@ jobs:
               sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' |
               sort -V | tail -1
           )
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" \
-            --jq .object.sha 2>/dev/null || true)
+          existing=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$VERSION" \
+            --jq ".[] | select(.ref == \"refs/tags/v$VERSION\") | .object.sha")
           if [ -n "$existing" ]; then
             test "$existing" = "$RELEASE_SHA"
             test "$latest" = "$VERSION"
@@ -263,8 +264,9 @@ jobs:
         run: |
           set -euo pipefail
           tag="v$VERSION"
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
-            --jq .object.sha 2>/dev/null || true)
+          existing=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.sha")
           if [ -n "$existing" ]; then
             test "$existing" = "$RELEASE_SHA"
           else
