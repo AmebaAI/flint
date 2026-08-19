@@ -204,9 +204,35 @@ jobs:
       - name: Verify local publication task
         run: mise run publishLocal
 
+  create-release-tag:
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create or verify release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare-release.outputs.sha }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          existing=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.sha")
+          if [ -n "$existing" ]; then
+            test "$existing" = "$RELEASE_SHA"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$RELEASE_SHA" >/dev/null
+          fi
+
   build-release-image:
     name: Build release image (${{ matrix.arch }})
-    needs: prepare-release
+    needs: [prepare-release, create-release-tag]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -362,25 +388,6 @@ jobs:
                 "\(.os)/\(.architecture)"] |
               sort == ["linux/amd64", "linux/arm64"]
             '
-
-      - name: Create or verify release tag
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_SHA: ${{ needs.prepare-release.outputs.sha }}
-          VERSION: ${{ needs.prepare-release.outputs.version }}
-        run: |
-          set -euo pipefail
-          tag="v$VERSION"
-          existing=$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
-            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.sha")
-          if [ -n "$existing" ]; then
-            test "$existing" = "$RELEASE_SHA"
-          else
-            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$tag" -f sha="$RELEASE_SHA" >/dev/null
-          fi
 
       - name: Create or update GitHub Release
         shell: bash

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Release jobs now create or verify the Git tag before starting platform image
+  builds, so tag permission failures stop before expensive compilation.
+
 ### Security
 
 - Pinned the release container build and runtime base images by digest.

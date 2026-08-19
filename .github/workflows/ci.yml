@@ -1,6 +1,7 @@
+---
 name: CI
 
-on:
+"on":
   pull_request:
   push:
     branches: [main]
@@ -13,22 +14,193 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ci_workflow: ${{ steps.classify.outputs.ci_workflow }}
+      container: ${{ steps.classify.outputs.container }}
+      dependencies: ${{ steps.classify.outputs.dependencies }}
+      docker: ${{ steps.classify.outputs.docker }}
+      rust: ${{ steps.classify.outputs.rust }}
+      unknown: ${{ steps.classify.outputs.unknown }}
+      workflow: ${{ steps.classify.outputs.workflow }}
+    steps:
+      - name: Classify changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ci_workflow=false
+          container=false
+          dependencies=false
+          docker=false
+          rust=false
+          unknown=false
+          workflow=false
+          zero_sha='0000000000000000000000000000000000000000'
+
+          if [[ "$EVENT_NAME" == 'pull_request' ]]; then
+            changed_files=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+              --jq '.[].filename')
+          elif [[ "$BEFORE" == "$zero_sha" ]]; then
+            changed_files=''
+            unknown=true
+          else
+            changed_files=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$AFTER" \
+              --jq '.files[].filename')
+          fi
+
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/*)
+                workflow=true
+                if [[ "$path" == '.github/workflows/ci.yml' ]]; then
+                  ci_workflow=true
+                  container=true
+                  dependencies=true
+                  docker=true
+                  rust=true
+                fi
+                ;;
+              README.md|CHANGELOG.md|CONTRIBUTING.md|SECURITY.md|LICENSE|.github/CODEOWNERS|.agents/*|docs/*)
+                ;;
+              Cargo.toml|Cargo.lock|*/Cargo.toml)
+                container=true
+                dependencies=true
+                docker=true
+                rust=true
+                ;;
+              src/*|config/*|mise.toml)
+                container=true
+                docker=true
+                rust=true
+                ;;
+              tests/*)
+                docker=true
+                rust=true
+                ;;
+              Dockerfile|.dockerignore)
+                container=true
+                docker=true
+                ;;
+              compose.example.yml|examples/*)
+                docker=true
+                ;;
+              deny.toml)
+                dependencies=true
+                ;;
+              build.rs|.cargo/*|rust-toolchain|rust-toolchain.toml)
+                rust=true
+                ;;
+              *)
+                unknown=true
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          {
+            printf 'ci_workflow=%s\n' "$ci_workflow"
+            printf 'container=%s\n' "$container"
+            printf 'dependencies=%s\n' "$dependencies"
+            printf 'docker=%s\n' "$docker"
+            printf 'rust=%s\n' "$rust"
+            printf 'unknown=%s\n' "$unknown"
+            printf 'workflow=%s\n' "$workflow"
+          } >> "$GITHUB_OUTPUT"
+
   verify:
     name: Verify
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Check out source
+      - name: Check out source for verification
+        if: >-
+          ${{ needs.changes.result != 'success' ||
+          needs.changes.outputs.workflow == 'true' ||
+          needs.changes.outputs.rust == 'true' ||
+          needs.changes.outputs.unknown == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Validate workflow YAML
+        if: >-
+          ${{ needs.changes.result != 'success' ||
+          needs.changes.outputs.workflow == 'true' }}
+        shell: bash
+        run: |
+          ruby - <<'RUBY'
+          require 'yaml'
+          Dir['.github/workflows/*.{yml,yaml}'].sort.each do |path|
+            YAML.parse_file(path)
+            puts "Valid YAML: #{path}"
+          end
+          RUBY
+      - name: Install actionlint
+        if: >-
+          ${{ needs.changes.result != 'success' ||
+          needs.changes.outputs.workflow == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint_1.7.12_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$archive" "$url"
+          printf '%s  %s\n' \
+            '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' \
+            "$archive" | sha256sum --check --status
+          tar --extract --file "$archive" --directory "$RUNNER_TEMP"
+          test -x "$RUNNER_TEMP/actionlint"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Lint workflows
+        if: >-
+          ${{ needs.changes.result != 'success' ||
+          needs.changes.outputs.workflow == 'true' }}
+        run: actionlint -color
       - name: Install toolchain
+        if: >-
+          ${{ needs.changes.result != 'success' ||
+          needs.changes.outputs.rust == 'true' ||
+          needs.changes.outputs.unknown == 'true' }}
         uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518
       - name: Run verification gate
+        if: >-
+          ${{ needs.changes.result != 'success' ||
+          needs.changes.outputs.rust == 'true' ||
+          needs.changes.outputs.unknown == 'true' }}
         run: mise run check
+      - name: Confirm lightweight verification
+        if: >-
+          ${{ needs.changes.result == 'success' &&
+          needs.changes.outputs.workflow != 'true' &&
+          needs.changes.outputs.rust != 'true' &&
+          needs.changes.outputs.unknown != 'true' }}
+        run: |
+          echo 'No Rust or workflow changes require substantive verification.'
 
   docker:
     name: Docker integration
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (needs.changes.result != 'success' ||
+      needs.changes.outputs.unknown == 'true' ||
+      needs.changes.outputs.ci_workflow == 'true' ||
+      needs.changes.outputs.docker == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -50,6 +222,12 @@ jobs:
 
   dependencies:
     name: Dependency policy
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (needs.changes.result != 'success' ||
+      needs.changes.outputs.unknown == 'true' ||
+      needs.changes.outputs.ci_workflow == 'true' ||
+      needs.changes.outputs.dependencies == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -64,6 +242,12 @@ jobs:
 
   container-security:
     name: Container security
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (needs.changes.result != 'success' ||
+      needs.changes.outputs.unknown == 'true' ||
+      needs.changes.outputs.ci_workflow == 'true' ||
+      needs.changes.outputs.container == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
