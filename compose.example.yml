@@ -8,14 +8,10 @@ services:
       PORT: "8080"
       AGENTCORE_RUNTIME_SOURCE: docker
       AGENTCORE_RUNTIME_IMAGES: >-
-        ${AGENTCORE_RUNTIME_IMAGES:-flint-runtime-fixture:local}
+        ${AGENTCORE_RUNTIME_IMAGES:-flint-runtime-example}
       AGENTCORE_RUNTIME_OWNER: ${AGENTCORE_RUNTIME_OWNER:?required}
       FLINT_CONNECTIVITY_MODE: container
       FLINT_DOCKER_NETWORK: ${FLINT_DOCKER_NETWORK:-flint-agentcore}
-      FLINT_RUNTIME_ENV_ALLOWLIST: FLINT_FIXTURE_ALLOWED,FLINT_FIXTURE_UNSET
-      FLINT_FIXTURE_ALLOWED: fixture-allowed
-      FLINT_FIXTURE_UNAPPROVED: must-not-forward
-      FLINT_RUNTIME_HEADER_ALLOWLIST: x-flint-invocation-id
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:${FLINT_PORT:-35469}:8080"
