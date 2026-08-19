@@ -9,9 +9,14 @@ services:
       AGENTCORE_RUNTIME_SOURCE: docker
       AGENTCORE_RUNTIME_IMAGES: >-
         ${AGENTCORE_RUNTIME_IMAGES:-flint-runtime-example}
-      AGENTCORE_RUNTIME_OWNER: ${AGENTCORE_RUNTIME_OWNER:?required}
+      AGENTCORE_RUNTIME_OWNER: ${AGENTCORE_RUNTIME_OWNER:-flint}
       FLINT_CONNECTIVITY_MODE: container
       FLINT_DOCKER_NETWORK: ${FLINT_DOCKER_NETWORK:-flint-agentcore}
+      FLINT_STATE_PATH: /var/lib/flint/flint.sqlite3
+      FLINT_SESSION_STORAGE_MOUNT_PATH: >-
+        ${FLINT_SESSION_STORAGE_MOUNT_PATH:-/workspace}
+      FLINT_HEALTH_CHECK_INTERVAL_SECONDS: >-
+        ${FLINT_HEALTH_CHECK_INTERVAL_SECONDS:-5}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "127.0.0.1:${FLINT_PORT:-35469}:8080"
@@ -19,6 +24,7 @@ services:
       - flint-agentcore
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - flint-state:/var/lib/flint
     healthcheck:
       test: [CMD, curl, --fail, --silent, "http://127.0.0.1:8080/_local/health"]
       interval: 2s
@@ -37,3 +43,6 @@ services:
 networks:
   flint-agentcore:
     name: ${FLINT_DOCKER_NETWORK:-flint-agentcore}
+
+volumes:
+  flint-state:

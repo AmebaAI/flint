@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -11,9 +11,14 @@ use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::catalog::{LocalIdentity, ResolvedRuntime};
 #[cfg(test)]
 use crate::runtime::InvocationRuntime;
+use crate::{
+    catalog::{LocalIdentity, ResolvedRuntime},
+    session_store::{SessionRecord, SessionStore, SessionStoreError, StoredSessionState},
+};
+
+const MAX_CONSECUTIVE_HEALTH_FAILURES: u8 = 3;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SessionKey {
@@ -85,6 +90,10 @@ impl Drop for SessionCommandExecution {
 
 #[async_trait]
 pub(crate) trait SessionBackend: Send + Sync {
+    fn volume_name(&self, key: &SessionKey) -> String {
+        format!("flint-session-{}", key.runtime_session_id)
+    }
+
     async fn start(
         &self,
         key: &SessionKey,
@@ -187,7 +196,10 @@ pub(crate) struct SessionManager {
 
 struct SessionManagerInner {
     backend: Arc<dyn SessionBackend>,
+    store: SessionStore,
+    health_check_interval: Duration,
     entries: Mutex<HashMap<SessionKey, SessionEntry>>,
+    drifted: Mutex<HashMap<SessionKey, String>>,
     next_generation: Mutex<u64>,
 }
 
@@ -207,26 +219,53 @@ impl Drop for StartingTransitionGuard {
         self.cancellation.cancel();
         let completion = {
             let mut entries = self.inner.entries.lock().expect("session state lock");
-            match entries.get(&self.key) {
-                Some(SessionEntry::Starting { generation, .. })
-                    if *generation == self.generation =>
-                {
-                    entries.remove(&self.key);
+            match entries.remove(&self.key) {
+                Some(SessionEntry::Starting {
+                    generation,
+                    runtime,
+                    ..
+                }) if generation == self.generation => {
+                    entries.insert(
+                        self.key.clone(),
+                        SessionEntry::Stopped {
+                            generation,
+                            runtime,
+                        },
+                    );
                     None
                 }
                 Some(SessionEntry::Stopping {
                     generation,
+                    runtime,
+                    client_token: _,
                     notify,
                     outcome,
-                    ..
-                }) if *generation == self.generation => {
-                    let completion = (Arc::clone(notify), Arc::clone(outcome));
-                    entries.remove(&self.key);
+                }) if generation == self.generation => {
+                    let completion = (Arc::clone(&notify), Arc::clone(&outcome));
+                    entries.insert(
+                        self.key.clone(),
+                        SessionEntry::Stopped {
+                            generation,
+                            runtime,
+                        },
+                    );
                     Some(completion)
                 }
-                _ => None,
+                Some(entry) => {
+                    entries.insert(self.key.clone(), entry);
+                    None
+                }
+                None => None,
             }
         };
+        if let Err(error) = self.inner.store.mark_stopped(
+            &self.key,
+            unix_time_millis(),
+            Some("session provisioning task was interrupted"),
+            None,
+        ) {
+            tracing::error!(%error, "failed to persist interrupted session provisioning");
+        }
         if let Some((notify, outcome)) = completion {
             *outcome.lock().expect("stop outcome lock") = Some(Err(
                 "session provisioning task was interrupted before cleanup confirmation".to_owned(),
@@ -292,6 +331,7 @@ enum SessionEntry {
         started_at: Instant,
         last_activity: Instant,
         active_requests: usize,
+        consecutive_health_failures: u8,
         idle_timeout_seconds: u64,
         maximum_lifetime_seconds: u64,
     },
@@ -301,6 +341,10 @@ enum SessionEntry {
         client_token: Option<String>,
         notify: Arc<Notify>,
         outcome: Arc<Mutex<Option<Result<(), String>>>>,
+    },
+    Stopped {
+        generation: u64,
+        runtime: Arc<ResolvedRuntime>,
     },
     Failed {
         generation: u64,
@@ -317,9 +361,19 @@ impl SessionEntry {
             Self::Starting { runtime, .. }
             | Self::Ready { runtime, .. }
             | Self::Stopping { runtime, .. }
+            | Self::Stopped { runtime, .. }
             | Self::Failed { runtime, .. } => runtime,
         }
     }
+}
+
+fn unix_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 async fn finish_stop(
@@ -332,24 +386,39 @@ async fn finish_stop(
     outcome: Arc<Mutex<Option<Result<(), String>>>>,
 ) -> Result<(), SessionError> {
     cancellation.cancel();
-    let stopped = inner.backend.stop(&container).await;
+    let mut stopped = inner.backend.stop(&container).await;
     let mut entries = inner.entries.lock().expect("session state lock");
-    let runtime = match entries.get(&key) {
+    let session = match entries.get(&key) {
         Some(SessionEntry::Stopping {
             generation: current,
             runtime,
+            client_token,
             ..
-        }) if *current == generation => Some(Arc::clone(runtime)),
+        }) if *current == generation => Some((Arc::clone(runtime), client_token.clone())),
         _ => None,
     };
-    if let Some(runtime) = runtime {
+    if let Some((runtime, client_token)) = session {
+        if stopped.is_ok()
+            && let Err(error) =
+                inner
+                    .store
+                    .mark_stopped(&key, unix_time_millis(), None, client_token.as_deref())
+        {
+            stopped = Err(format!("persist stopped session: {error}"));
+        }
         match &stopped {
             Ok(()) => {
-                entries.remove(&key);
+                entries.insert(
+                    key.clone(),
+                    SessionEntry::Stopped {
+                        generation,
+                        runtime,
+                    },
+                );
             }
             Err(message) => {
                 entries.insert(
-                    key,
+                    key.clone(),
                     SessionEntry::Failed {
                         generation,
                         runtime,
@@ -367,16 +436,105 @@ async fn finish_stop(
 }
 
 impl SessionManager {
+    #[cfg(test)]
     pub(crate) fn new(backend: Arc<dyn SessionBackend>) -> Self {
+        Self::with_store(
+            backend,
+            SessionStore::in_memory().expect("in-memory session store"),
+            Duration::from_secs(1),
+        )
+    }
+
+    pub(crate) fn with_store(
+        backend: Arc<dyn SessionBackend>,
+        store: SessionStore,
+        health_check_interval: Duration,
+    ) -> Self {
         let manager = Self {
             inner: Arc::new(SessionManagerInner {
                 backend,
+                store,
+                health_check_interval,
                 entries: Mutex::new(HashMap::new()),
+                drifted: Mutex::new(HashMap::new()),
                 next_generation: Mutex::new(0),
             }),
         };
         manager.start_reaper();
         manager
+    }
+
+    pub(crate) fn validate_record(
+        &self,
+        runtime: &ResolvedRuntime,
+        record: &SessionRecord,
+    ) -> Result<(), SessionError> {
+        if record.key.runtime_arn != runtime.runtime_arn
+            || record.key.qualifier != runtime.qualifier
+            || record.catalog_generation != runtime.catalog_generation
+            || record.image != runtime.image
+            || record.image_id != runtime.image_id
+        {
+            return Err(SessionError::DeploymentDrift(format!(
+                "stored session {} deployment pin does not match the current runtime catalog",
+                record.key.runtime_session_id
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_stopped(
+        &self,
+        runtime: Arc<ResolvedRuntime>,
+        record: &SessionRecord,
+    ) -> Result<(), SessionError> {
+        self.validate_record(&runtime, record)?;
+        self.inner.store.mark_stopped(
+            &record.key,
+            record.last_activity_at_unix_millis,
+            record.last_error.as_deref(),
+            record.last_stop_token.as_deref(),
+        )?;
+        let generation = self.next_generation();
+        let mut entries = self.inner.entries.lock().expect("session state lock");
+        if entries.contains_key(&record.key) {
+            return Err(SessionError::RetryableConflict(
+                "runtime session was already restored".to_owned(),
+            ));
+        }
+        entries.insert(
+            record.key.clone(),
+            SessionEntry::Stopped {
+                generation,
+                runtime,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn restore_drifted(
+        &self,
+        record: &SessionRecord,
+        message: String,
+    ) -> Result<(), SessionError> {
+        if self
+            .inner
+            .entries
+            .lock()
+            .expect("session state lock")
+            .contains_key(&record.key)
+        {
+            return Err(SessionError::RetryableConflict(
+                "runtime session was already restored".to_owned(),
+            ));
+        }
+        let mut drifted = self.inner.drifted.lock().expect("drifted session lock");
+        if drifted.insert(record.key.clone(), message).is_some() {
+            return Err(SessionError::RetryableConflict(
+                "drifted runtime session was already restored".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn pinned_runtime(
@@ -418,7 +576,24 @@ impl SessionManager {
         let generation = self.next_generation();
         let cancellation = CancellationToken::new();
         let now = Instant::now();
+        let now_unix_millis = unix_time_millis();
         let started_at = now.checked_sub(container.age).unwrap_or(now);
+        let compute_started_at_unix_millis = now_unix_millis
+            .saturating_sub(container.age.as_millis().try_into().unwrap_or(i64::MAX));
+        let record = SessionRecord {
+            key: key.clone(),
+            catalog_generation: runtime.catalog_generation.clone(),
+            image: runtime.image.clone(),
+            image_id: runtime.image_id.clone(),
+            volume_name: self.inner.backend.volume_name(&key),
+            created_at_unix_millis: compute_started_at_unix_millis,
+            last_activity_at_unix_millis: now_unix_millis,
+            compute_started_at_unix_millis: Some(compute_started_at_unix_millis),
+            state: StoredSessionState::Ready,
+            last_error: None,
+            last_stop_token: None,
+        };
+        self.inner.store.upsert(&record)?;
         let mut entries = self.inner.entries.lock().expect("session state lock");
         if entries.contains_key(&key) {
             return Err(SessionError::RetryableConflict(
@@ -435,6 +610,7 @@ impl SessionManager {
                 started_at,
                 last_activity: now,
                 active_requests: 0,
+                consecutive_health_failures: 0,
                 idle_timeout_seconds: runtime.lifecycle.idle_timeout_seconds,
                 maximum_lifetime_seconds: runtime.lifecycle.maximum_lifetime_seconds,
             },
@@ -448,8 +624,13 @@ impl SessionManager {
         };
         let inner = Arc::downgrade(&self.inner);
         handle.spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut interval = tokio::time::interval(
+                inner
+                    .upgrade()
+                    .map_or(Duration::from_secs(5), |inner| inner.health_check_interval),
+            );
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
             loop {
                 interval.tick().await;
                 let Some(inner) = inner.upgrade() else {
@@ -465,55 +646,154 @@ impl SessionManager {
         runtime: Arc<ResolvedRuntime>,
         runtime_session_id: String,
     ) -> Result<SessionLease, SessionError> {
+        enum AcquirePlan {
+            Verify {
+                generation: u64,
+                container: Arc<SessionContainer>,
+            },
+            Start {
+                generation: u64,
+                cancellation: CancellationToken,
+            },
+        }
+
         let key = SessionKey::new(&runtime, runtime_session_id);
-        let (generation, cancellation) = {
-            let mut entries = self.inner.entries.lock().expect("session state lock");
-            match entries.get_mut(&key) {
-                Some(SessionEntry::Ready {
+        if let Some(message) = self
+            .inner
+            .drifted
+            .lock()
+            .expect("drifted session lock")
+            .get(&key)
+        {
+            return Err(SessionError::DeploymentDrift(message.clone()));
+        }
+        let mut runtime = runtime;
+        let (generation, cancellation) = loop {
+            let plan = {
+                let mut entries = self.inner.entries.lock().expect("session state lock");
+                let ready = match entries.get(&key) {
+                    Some(SessionEntry::Ready {
+                        generation,
+                        container,
+                        ..
+                    }) => Some((*generation, Arc::clone(container))),
+                    Some(SessionEntry::Starting { .. }) => {
+                        return Err(SessionError::RetryableConflict(
+                            "runtime session is starting".to_owned(),
+                        ));
+                    }
+                    Some(SessionEntry::Stopping { .. }) => {
+                        return Err(SessionError::RetryableConflict(
+                            "runtime session is stopping".to_owned(),
+                        ));
+                    }
+                    Some(SessionEntry::Stopped {
+                        runtime: stored_runtime,
+                        ..
+                    }) => {
+                        runtime = Arc::clone(stored_runtime);
+                        None
+                    }
+                    Some(SessionEntry::Failed { message, .. }) => {
+                        return Err(SessionError::Provisioning(message.clone()));
+                    }
+                    None => {
+                        let now = unix_time_millis();
+                        self.inner.store.upsert(&SessionRecord {
+                            key: key.clone(),
+                            catalog_generation: runtime.catalog_generation.clone(),
+                            image: runtime.image.clone(),
+                            image_id: runtime.image_id.clone(),
+                            volume_name: self.inner.backend.volume_name(&key),
+                            created_at_unix_millis: now,
+                            last_activity_at_unix_millis: now,
+                            compute_started_at_unix_millis: None,
+                            state: StoredSessionState::Stopped,
+                            last_error: None,
+                            last_stop_token: None,
+                        })?;
+                        None
+                    }
+                };
+                if let Some((generation, container)) = ready {
+                    AcquirePlan::Verify {
+                        generation,
+                        container,
+                    }
+                } else {
+                    let generation = self.next_generation();
+                    let cancellation = CancellationToken::new();
+                    entries.insert(
+                        key.clone(),
+                        SessionEntry::Starting {
+                            generation,
+                            runtime: Arc::clone(&runtime),
+                            cancellation: cancellation.clone(),
+                        },
+                    );
+                    AcquirePlan::Start {
+                        generation,
+                        cancellation,
+                    }
+                }
+            };
+
+            match plan {
+                AcquirePlan::Start {
+                    generation,
+                    cancellation,
+                } => break (generation, cancellation),
+                AcquirePlan::Verify {
                     generation,
                     container,
-                    cancellation,
-                    last_activity,
-                    active_requests,
-                    ..
-                }) => {
-                    *active_requests += 1;
-                    *last_activity = Instant::now();
-                    return Ok(SessionLease {
-                        inner: Arc::clone(&self.inner),
-                        key,
-                        generation: *generation,
-                        container: Arc::clone(container),
-                        cancellation: cancellation.child_token(),
-                    });
+                } => {
+                    let mut health = SessionHealth::Unhealthy;
+                    for attempt in 1..=MAX_CONSECUTIVE_HEALTH_FAILURES {
+                        health = self.inner.backend.ping(&container).await;
+                        if health != SessionHealth::Unhealthy {
+                            break;
+                        }
+                        if attempt < MAX_CONSECUTIVE_HEALTH_FAILURES {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                    if health != SessionHealth::Unhealthy {
+                        let lease = {
+                            let mut entries =
+                                self.inner.entries.lock().expect("session state lock");
+                            match entries.get_mut(&key) {
+                                Some(SessionEntry::Ready {
+                                    generation: current,
+                                    container,
+                                    cancellation,
+                                    last_activity,
+                                    active_requests,
+                                    consecutive_health_failures,
+                                    ..
+                                }) if *current == generation => {
+                                    *active_requests += 1;
+                                    *last_activity = Instant::now();
+                                    *consecutive_health_failures = 0;
+                                    Some(SessionLease {
+                                        inner: Arc::clone(&self.inner),
+                                        key: key.clone(),
+                                        generation,
+                                        container: Arc::clone(container),
+                                        cancellation: cancellation.child_token(),
+                                    })
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(lease) = lease {
+                            self.inner.store.touch(&key, unix_time_millis())?;
+                            return Ok(lease);
+                        }
+                        continue;
+                    }
+                    self.stop_by_key(key.clone(), generation).await?;
                 }
-                Some(SessionEntry::Starting { .. }) => {
-                    return Err(SessionError::RetryableConflict(
-                        "runtime session is starting".to_owned(),
-                    ));
-                }
-                Some(SessionEntry::Stopping { .. }) => {
-                    return Err(SessionError::RetryableConflict(
-                        "runtime session is stopping".to_owned(),
-                    ));
-                }
-                Some(SessionEntry::Failed { message, .. }) => {
-                    return Err(SessionError::Provisioning(message.clone()));
-                }
-                None => {}
             }
-
-            let generation = self.next_generation();
-            let cancellation = CancellationToken::new();
-            entries.insert(
-                key.clone(),
-                SessionEntry::Starting {
-                    generation,
-                    runtime: Arc::clone(&runtime),
-                    cancellation: cancellation.clone(),
-                },
-            );
-            (generation, cancellation)
         };
 
         let mut transition = StartingTransitionGuard {
@@ -528,6 +808,68 @@ impl SessionManager {
             .backend
             .start(&key, Arc::clone(&runtime), cancellation.clone())
             .await;
+        let now_unix_millis = unix_time_millis();
+        let persisted = match &started {
+            Ok(container) => self.inner.store.mark_ready(
+                &key,
+                now_unix_millis
+                    .saturating_sub(container.age.as_millis().try_into().unwrap_or(i64::MAX)),
+                now_unix_millis,
+            ),
+            Err(message) => {
+                self.inner
+                    .store
+                    .mark_stopped(&key, now_unix_millis, Some(message), None)
+            }
+        };
+        if let Err(error) = persisted {
+            let cleanup_failure = if let Ok(container) = &started {
+                self.inner.backend.stop(container).await.err().map(|cleanup| {
+                    (
+                        Arc::new(container.clone()),
+                        format!(
+                            "persist ready session: {error}; clean up unpersisted compute: {cleanup}"
+                        ),
+                    )
+                })
+            } else {
+                None
+            };
+            let mut entries = self.inner.entries.lock().expect("session state lock");
+            if matches!(
+                entries.get(&key),
+                Some(SessionEntry::Starting {
+                    generation: current,
+                    ..
+                }) if *current == generation
+            ) {
+                if let Some((container, message)) = &cleanup_failure {
+                    entries.insert(
+                        key.clone(),
+                        SessionEntry::Failed {
+                            generation,
+                            runtime: Arc::clone(&runtime),
+                            message: format!("session cleanup must be retried: {message}"),
+                            container: Some(Arc::clone(container)),
+                            cancellation: cancellation.clone(),
+                        },
+                    );
+                } else {
+                    entries.insert(
+                        key.clone(),
+                        SessionEntry::Stopped {
+                            generation,
+                            runtime: Arc::clone(&runtime),
+                        },
+                    );
+                }
+            }
+            transition.armed = false;
+            return Err(cleanup_failure.map_or_else(
+                || SessionError::State(error),
+                |(_, message)| SessionError::Stopping(message),
+            ));
+        }
         let mut cleanup = None;
         let result = {
             let mut entries = self.inner.entries.lock().expect("session state lock");
@@ -551,6 +893,7 @@ impl SessionManager {
                                 started_at,
                                 last_activity: now,
                                 active_requests: 1,
+                                consecutive_health_failures: 0,
                                 idle_timeout_seconds: runtime.lifecycle.idle_timeout_seconds,
                                 maximum_lifetime_seconds: runtime
                                     .lifecycle
@@ -568,12 +911,9 @@ impl SessionManager {
                     Err(message) => {
                         entries.insert(
                             key.clone(),
-                            SessionEntry::Failed {
+                            SessionEntry::Stopped {
                                 generation,
                                 runtime: Arc::clone(&runtime),
-                                message: message.clone(),
-                                container: None,
-                                cancellation,
                             },
                         );
                         Err(SessionError::Provisioning(message))
@@ -592,16 +932,14 @@ impl SessionManager {
                         Err(message) => {
                             entries.insert(
                                 key.clone(),
-                                SessionEntry::Failed {
+                                SessionEntry::Stopped {
                                     generation,
                                     runtime: Arc::clone(&runtime),
-                                    message: message.clone(),
-                                    container: None,
-                                    cancellation: CancellationToken::new(),
                                 },
                             );
-                            *outcome.lock().expect("stop outcome lock") = Some(Err(message));
+                            *outcome.lock().expect("stop outcome lock") = Some(Ok(()));
                             notify.notify_waiters();
+                            tracing::warn!(%message, "session provisioning failed after stop began");
                         }
                     }
                     Err(SessionError::StoppedDuringProvisioning)
@@ -620,7 +958,15 @@ impl SessionManager {
         };
 
         if let Some((container, notify, outcome)) = cleanup {
-            let cleanup = self.inner.backend.stop(&container).await;
+            let mut cleanup = self.inner.backend.stop(&container).await;
+            if cleanup.is_ok()
+                && let Err(error) =
+                    self.inner
+                        .store
+                        .mark_stopped(&key, unix_time_millis(), None, None)
+            {
+                cleanup = Err(format!("persist stopped session: {error}"));
+            }
             let mut entries = self.inner.entries.lock().expect("session state lock");
             if matches!(
                 entries.get(&key),
@@ -631,7 +977,13 @@ impl SessionManager {
             ) {
                 match &cleanup {
                     Ok(()) => {
-                        entries.remove(&key);
+                        entries.insert(
+                            key.clone(),
+                            SessionEntry::Stopped {
+                                generation,
+                                runtime: Arc::clone(&runtime),
+                            },
+                        );
                     }
                     Err(message) => {
                         entries.insert(
@@ -703,10 +1055,48 @@ impl SessionManager {
         let plan = {
             let mut entries = self.inner.entries.lock().expect("session state lock");
             match entries.remove(&key) {
-                None
-                | Some(SessionEntry::Failed {
-                    container: None, ..
-                }) => StopPlan::Complete,
+                None => StopPlan::Complete,
+                Some(SessionEntry::Stopped {
+                    generation,
+                    runtime,
+                    ..
+                }) => {
+                    self.inner.store.mark_stopped(
+                        &key,
+                        unix_time_millis(),
+                        None,
+                        client_token.as_deref(),
+                    )?;
+                    entries.insert(
+                        key.clone(),
+                        SessionEntry::Stopped {
+                            generation,
+                            runtime,
+                        },
+                    );
+                    StopPlan::Complete
+                }
+                Some(SessionEntry::Failed {
+                    generation,
+                    runtime,
+                    container: None,
+                    ..
+                }) => {
+                    self.inner.store.mark_stopped(
+                        &key,
+                        unix_time_millis(),
+                        None,
+                        client_token.as_deref(),
+                    )?;
+                    entries.insert(
+                        key.clone(),
+                        SessionEntry::Stopped {
+                            generation,
+                            runtime,
+                        },
+                    );
+                    StopPlan::Complete
+                }
                 Some(SessionEntry::Failed {
                     generation,
                     runtime,
@@ -864,8 +1254,7 @@ impl SessionManager {
             key: SessionKey,
             generation: u64,
             container: Arc<SessionContainer>,
-            expired: bool,
-            observed_last_activity: Instant,
+            maximum_expired: bool,
         }
 
         let now = Instant::now();
@@ -878,23 +1267,17 @@ impl SessionManager {
                         generation,
                         container,
                         started_at,
-                        last_activity,
                         active_requests,
-                        idle_timeout_seconds,
                         maximum_lifetime_seconds,
                         ..
-                    } if now.duration_since(*started_at).as_secs() >= *maximum_lifetime_seconds
-                        || (*active_requests == 0
-                            && now.duration_since(*last_activity).as_secs()
-                                >= *idle_timeout_seconds) =>
-                    {
-                        Some(Candidate {
+                    } => {
+                        let maximum_expired =
+                            now.duration_since(*started_at).as_secs() >= *maximum_lifetime_seconds;
+                        (maximum_expired || *active_requests == 0).then(|| Candidate {
                             key: key.clone(),
                             generation: *generation,
                             container: Arc::clone(container),
-                            expired: now.duration_since(*started_at).as_secs()
-                                >= *maximum_lifetime_seconds,
-                            observed_last_activity: *last_activity,
+                            maximum_expired,
                         })
                     }
                     _ => None,
@@ -918,35 +1301,57 @@ impl SessionManager {
         };
 
         for candidate in candidates {
-            let health = if candidate.expired {
-                SessionHealth::Unhealthy
+            let health = if candidate.maximum_expired {
+                None
             } else {
-                self.inner.backend.ping(&candidate.container).await
+                Some(self.inner.backend.ping(&candidate.container).await)
             };
-            if health == SessionHealth::HealthyBusy {
-                let mut entries = self.inner.entries.lock().expect("session state lock");
-                if let Some(SessionEntry::Ready { last_activity, .. }) =
-                    entries.get_mut(&candidate.key)
-                {
-                    *last_activity = Instant::now();
-                }
-                continue;
-            }
+            let mut touched = false;
             let should_stop = {
-                let entries = self.inner.entries.lock().expect("session state lock");
-                matches!(
-                    entries.get(&candidate.key),
-                    Some(SessionEntry::Ready {
-                        generation,
-                        last_activity,
-                        active_requests,
-                        ..
-                    }) if *generation == candidate.generation
-                        && (candidate.expired
-                            || (*active_requests == 0
-                                && *last_activity == candidate.observed_last_activity))
-                )
+                let mut entries = self.inner.entries.lock().expect("session state lock");
+                let Some(SessionEntry::Ready {
+                    generation,
+                    last_activity,
+                    active_requests,
+                    consecutive_health_failures,
+                    idle_timeout_seconds,
+                    ..
+                }) = entries.get_mut(&candidate.key)
+                else {
+                    continue;
+                };
+                if *generation != candidate.generation {
+                    continue;
+                }
+                if candidate.maximum_expired {
+                    true
+                } else if *active_requests > 0 {
+                    false
+                } else {
+                    match health.expect("non-expired candidate has a health result") {
+                        SessionHealth::HealthyBusy => {
+                            *consecutive_health_failures = 0;
+                            *last_activity = Instant::now();
+                            touched = true;
+                            false
+                        }
+                        SessionHealth::Healthy => {
+                            *consecutive_health_failures = 0;
+                            now.duration_since(*last_activity).as_secs() >= *idle_timeout_seconds
+                        }
+                        SessionHealth::Unhealthy => {
+                            *consecutive_health_failures =
+                                consecutive_health_failures.saturating_add(1);
+                            *consecutive_health_failures >= MAX_CONSECUTIVE_HEALTH_FAILURES
+                        }
+                    }
+                }
             };
+            if touched
+                && let Err(error) = self.inner.store.touch(&candidate.key, unix_time_millis())
+            {
+                tracing::error!(%error, "failed to persist busy runtime session activity");
+            }
             if should_stop {
                 let _ = self.stop_by_key(candidate.key, candidate.generation).await;
             }
@@ -1058,6 +1463,7 @@ impl SessionManager {
                 SessionEntry::Starting { .. } => "starting",
                 SessionEntry::Ready { .. } => "ready",
                 SessionEntry::Stopping { .. } => "stopping",
+                SessionEntry::Stopped { .. } => "stopped",
                 SessionEntry::Failed { .. } => "failed",
             })
     }
@@ -1094,27 +1500,47 @@ impl SessionLease {
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
     }
+
+    pub(crate) async fn invalidate(&self) -> Result<(), SessionError> {
+        SessionManager {
+            inner: Arc::clone(&self.inner),
+        }
+        .stop_by_key(self.key.clone(), self.generation)
+        .await
+    }
 }
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        let mut entries = self.inner.entries.lock().expect("session state lock");
-        if let Some(SessionEntry::Ready {
-            generation,
-            last_activity,
-            active_requests,
-            ..
-        }) = entries.get_mut(&self.key)
-            && *generation == self.generation
-        {
-            *active_requests = active_requests.saturating_sub(1);
-            *last_activity = Instant::now();
+        let touched = {
+            let mut entries = self.inner.entries.lock().expect("session state lock");
+            if let Some(SessionEntry::Ready {
+                generation,
+                last_activity,
+                active_requests,
+                ..
+            }) = entries.get_mut(&self.key)
+                && *generation == self.generation
+            {
+                *active_requests = active_requests.saturating_sub(1);
+                *last_activity = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if touched && let Err(error) = self.inner.store.touch(&self.key, unix_time_millis()) {
+            tracing::error!(%error, "failed to persist runtime session activity");
         }
     }
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum SessionError {
+    #[error("session state failed: {0}")]
+    State(#[from] SessionStoreError),
+    #[error("session deployment drifted: {0}")]
+    DeploymentDrift(String),
     #[error("retryable session conflict: {0}")]
     RetryableConflict(String),
     #[error("session provisioning failed: {0}")]
@@ -1141,7 +1567,7 @@ mod tests {
 
     use super::{
         CommandEvent, CommandExecution, SessionBackend, SessionContainer, SessionEntry,
-        SessionError, SessionHealth, SessionKey, SessionManager,
+        SessionError, SessionHealth, SessionKey, SessionManager, SessionStore, StoredSessionState,
     };
     use crate::catalog::{LocalIdentity, RuntimeCatalog};
 
@@ -1267,6 +1693,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unhealthy_ready_session_is_reprovisioned_before_reuse() {
+        let backend = Arc::new(FakeBackend::default());
+        let manager = SessionManager::new(backend.clone());
+        let deployment = runtime();
+        let first = manager
+            .acquire(Arc::clone(&deployment), "session-a".to_owned())
+            .await
+            .expect("first lease");
+        let first_id = first.container.id.clone();
+        drop(first);
+        backend
+            .health
+            .lock()
+            .expect("health lock")
+            .insert(first_id.clone(), SessionHealth::Unhealthy);
+
+        let replacement = manager
+            .acquire(deployment, "session-a".to_owned())
+            .await
+            .expect("replacement lease");
+
+        assert_ne!(replacement.container.id, first_id);
+        assert_eq!(
+            backend.stops.lock().expect("stops lock").as_slice(),
+            [first_id]
+        );
+        assert_eq!(backend.starts.lock().expect("starts lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn control_plane_requires_three_unhealthy_checks_before_stopping_compute() {
+        let backend = Arc::new(FakeBackend::default());
+        let manager = SessionManager::new(backend.clone());
+        let deployment = runtime();
+        let lease = manager
+            .acquire(Arc::clone(&deployment), "session-a".to_owned())
+            .await
+            .expect("lease");
+        let key = SessionKey::new(&deployment, "session-a".to_owned());
+        backend
+            .health
+            .lock()
+            .expect("health lock")
+            .insert(lease.container.id.clone(), SessionHealth::Unhealthy);
+        drop(lease);
+
+        for _ in 0..2 {
+            manager.reap_once().await;
+            assert_eq!(manager.state(&key), Some("ready"));
+        }
+        manager.reap_once().await;
+
+        assert_eq!(manager.state(&key), Some("stopped"));
+        assert_eq!(backend.stops.lock().expect("stops lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stopped_session_restores_from_sqlite_and_rejects_catalog_drift() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = SessionStore::in_memory().expect("session store");
+        let original = runtime();
+        let first_manager =
+            SessionManager::with_store(backend.clone(), store.clone(), Duration::from_secs(5));
+        drop(
+            first_manager
+                .acquire(Arc::clone(&original), "session-a".to_owned())
+                .await
+                .expect("first lease"),
+        );
+        first_manager
+            .stop(&original, "session-a".to_owned(), None)
+            .await
+            .expect("stop first compute");
+        let record = store
+            .load_all()
+            .expect("load session")
+            .pop()
+            .expect("stored session");
+        drop(first_manager);
+
+        let restored_manager =
+            SessionManager::with_store(backend.clone(), store.clone(), Duration::from_secs(5));
+        restored_manager
+            .restore_stopped(Arc::clone(&original), &record)
+            .expect("restore stopped session");
+        let replacement = restored_manager
+            .acquire(Arc::clone(&original), "session-a".to_owned())
+            .await
+            .expect("resume restored session");
+        assert_eq!(replacement.container.id, "container-2");
+        drop(replacement);
+
+        let mut drifted = (*original).clone();
+        drifted.catalog_generation = "drifted".to_owned();
+        drifted.image_id = "sha256:drifted".to_owned();
+        let drifted = Arc::new(drifted);
+        let another_manager = SessionManager::with_store(backend, store, Duration::from_secs(5));
+        let error = another_manager
+            .restore_stopped(Arc::clone(&drifted), &record)
+            .expect_err("catalog drift must prevent restoration");
+        let SessionError::DeploymentDrift(message) = error else {
+            panic!("catalog drift returned the wrong session error");
+        };
+        another_manager
+            .restore_drifted(&record, message)
+            .expect("quarantine drifted session");
+        assert!(matches!(
+            another_manager
+                .acquire(Arc::clone(&drifted), "session-a".to_owned())
+                .await,
+            Err(SessionError::DeploymentDrift(_))
+        ));
+        drop(
+            another_manager
+                .acquire(drifted, "new-session".to_owned())
+                .await
+                .expect("new session uses the current deployment"),
+        );
+    }
+
+    #[tokio::test]
     async fn active_session_keeps_its_pinned_deployment_until_stopped() {
         let manager = SessionManager::new(Arc::new(FakeBackend::default()));
         let original = runtime();
@@ -1309,17 +1856,16 @@ mod tests {
             .stop(&pinned, "pinned-session".to_owned(), None)
             .await
             .expect("stop pinned session");
-        assert!(
-            manager
-                .pinned_runtime(
-                    &original.runtime_arn,
-                    None,
-                    Some(&original.qualifier),
-                    "pinned-session",
-                    &identity,
-                )
-                .is_none()
-        );
+        let stopped = manager
+            .pinned_runtime(
+                &original.runtime_arn,
+                None,
+                Some(&original.qualifier),
+                "pinned-session",
+                &identity,
+            )
+            .expect("stopped logical session keeps its deployment pin");
+        assert!(Arc::ptr_eq(&stopped, &original));
     }
 
     #[tokio::test]
@@ -1397,7 +1943,7 @@ mod tests {
         assert_eq!(manager.state(&key), Some("starting"));
         acquiring.abort();
         let _ = acquiring.await;
-        assert_eq!(manager.state(&key), None);
+        assert_eq!(manager.state(&key), Some("stopped"));
 
         *backend.start_gate.lock().expect("start gate lock") = None;
         drop(
@@ -1422,12 +1968,13 @@ mod tests {
         tokio::task::yield_now().await;
         stop_gate.notify_waiters();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while manager.state(&key).is_some() {
+            while manager.state(&key) == Some("stopping") {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("drop guard completes stop");
+        assert_eq!(manager.state(&key), Some("stopped"));
     }
 
     #[tokio::test]
@@ -1456,6 +2003,62 @@ mod tests {
         assert_eq!(
             backend.stops.lock().expect("stops lock").as_slice(),
             [first_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_after_ready_persistence_error_remains_retryable() {
+        let backend = Arc::new(FakeBackend::default());
+        *backend.stop_failures.lock().expect("stop failures lock") = 1;
+        let store = SessionStore::in_memory().expect("session store");
+        store
+            .fail_ready_writes_for_test()
+            .expect("install ready-write failure");
+        let manager =
+            SessionManager::with_store(backend.clone(), store.clone(), Duration::from_secs(3_600));
+        let deployment = runtime();
+        let key = SessionKey::new(&deployment, "session-a".to_owned());
+
+        let error = match manager.acquire(deployment, "session-a".to_owned()).await {
+            Ok(_) => panic!("ready persistence unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, SessionError::Stopping(_)));
+        assert!(error.to_string().contains("fixture mark_ready failure"));
+        assert!(error.to_string().contains("fixture cleanup failure"));
+        assert!(matches!(
+            manager
+                .inner
+                .entries
+                .lock()
+                .expect("session state lock")
+                .get(&key),
+            Some(SessionEntry::Failed {
+                container: Some(_),
+                ..
+            })
+        ));
+
+        manager.reap_once().await;
+
+        assert!(matches!(
+            manager
+                .inner
+                .entries
+                .lock()
+                .expect("session state lock")
+                .get(&key),
+            Some(SessionEntry::Stopped { .. })
+        ));
+        assert_eq!(backend.stops.lock().expect("stops lock").len(), 2);
+        assert_eq!(
+            store
+                .get(&key)
+                .expect("stored session")
+                .expect("record")
+                .state,
+            StoredSessionState::Stopped
         );
     }
 
@@ -1604,7 +2207,7 @@ mod tests {
             .await
             .expect("duplicate stop task")
             .expect("idempotent duplicate stop");
-        assert_eq!(manager.state(&key), None);
+        assert_eq!(manager.state(&key), Some("stopped"));
     }
 
     #[tokio::test]
@@ -1653,7 +2256,7 @@ mod tests {
         }
         manager.reap_once().await;
         assert!(lease.cancellation.is_cancelled());
-        assert_eq!(manager.state(&key), None);
+        assert_eq!(manager.state(&key), Some("stopped"));
         assert_eq!(backend.stops.lock().expect("stops lock").len(), 1);
     }
 
@@ -1686,7 +2289,7 @@ mod tests {
         manager.reap_once().await;
         assert_eq!(manager.state(&key), Some("failed"));
         manager.reap_once().await;
-        assert_eq!(manager.state(&key), None);
+        assert_eq!(manager.state(&key), Some("stopped"));
         assert_eq!(backend.stops.lock().expect("stops lock").len(), 2);
     }
 
@@ -1746,7 +2349,7 @@ mod tests {
             *last_activity = Instant::now() - Duration::from_secs(1);
         }
         manager.reap_once().await;
-        assert_eq!(manager.state(&key), None);
+        assert_eq!(manager.state(&key), Some("stopped"));
         assert_eq!(backend.stops.lock().expect("stops lock").len(), 1);
     }
 }

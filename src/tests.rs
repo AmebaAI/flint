@@ -12,7 +12,9 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use bollard::query_parameters::ListContainersOptionsBuilder;
+use bollard::query_parameters::{
+    ListContainersOptionsBuilder, ListVolumesOptionsBuilder, RemoveVolumeOptionsBuilder,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -59,6 +61,29 @@ async fn json_body(response: axum::response::Response) -> Value {
         .await
         .expect("response body");
     serde_json::from_slice(&body).expect("response JSON")
+}
+
+async fn remove_owned_volumes(docker: &bollard::Docker, runtime_owner: &str) {
+    let owner_label = format!("agentcore.emulator.owner={runtime_owner}");
+    let filters = HashMap::from([("label", vec![owner_label.as_str()])]);
+    let options = ListVolumesOptionsBuilder::default()
+        .filters(&filters)
+        .build();
+    for volume in docker
+        .list_volumes(Some(options))
+        .await
+        .expect("list test session volumes")
+        .volumes
+        .unwrap_or_default()
+    {
+        docker
+            .remove_volume(
+                &volume.name,
+                Some(RemoveVolumeOptionsBuilder::default().force(true).build()),
+            )
+            .await
+            .expect("remove test session volume");
+    }
 }
 
 #[tokio::test]
@@ -870,8 +895,88 @@ async fn configured_global_concurrency_queues_other_identities() {
 
 #[tokio::test]
 #[ignore = "requires local Docker and the flint-runtime-fixture image"]
+async fn real_docker_edge_reprovisions_a_killed_session() {
+    let mut config = super::RuntimeConfig::test_defaults();
+    config.runtime_owner = format!("agentcore-edge-kill-test-{}", uuid::Uuid::new_v4());
+    let runtime_owner = config.runtime_owner.clone();
+    let app = super::production_router(config)
+        .await
+        .expect("production router");
+    let runtime_session_id = "20000000-0000-0000-0000-000000000099";
+    let first = app
+        .clone()
+        .oneshot(invocation_request(
+            "50000000-0000-0000-0000-000000000099",
+            runtime_session_id,
+        ))
+        .await
+        .expect("first Docker invocation");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let docker = bollard::Docker::connect_with_local_defaults().expect("Docker connection");
+    let filters = HashMap::from([(
+        "label".to_owned(),
+        vec![
+            "agentcore.emulator.managed=true".to_owned(),
+            format!("agentcore.emulator.owner={runtime_owner}"),
+            format!("agentcore.emulator.runtime-session-id={runtime_session_id}"),
+        ],
+    )]);
+    let options = ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    let original_id = docker
+        .list_containers(Some(options.clone()))
+        .await
+        .expect("list original session container")
+        .into_iter()
+        .next()
+        .and_then(|container| container.id)
+        .expect("original session container ID");
+    docker
+        .kill_container(&original_id, None)
+        .await
+        .expect("kill original session container");
+
+    let replacement = app
+        .clone()
+        .oneshot(invocation_request(
+            "50000000-0000-0000-0000-000000000100",
+            runtime_session_id,
+        ))
+        .await
+        .expect("replacement Docker invocation");
+    let replacement_status = replacement.status();
+    let replacement_body = json_body(replacement).await;
+    let replacement_ids = docker
+        .list_containers(Some(options))
+        .await
+        .expect("list replacement session container")
+        .into_iter()
+        .filter(|container| {
+            container.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
+        })
+        .filter_map(|container| container.id)
+        .collect::<Vec<_>>();
+
+    let stop = app
+        .oneshot(stop_session_request(runtime_session_id))
+        .await
+        .expect("stop replacement runtime session");
+    remove_owned_volumes(&docker, &runtime_owner).await;
+
+    assert_eq!(replacement_status, StatusCode::OK, "{replacement_body}");
+    assert_eq!(replacement_ids.len(), 1);
+    assert_ne!(replacement_ids[0], original_id);
+    assert_eq!(stop.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires local Docker and the flint-runtime-fixture image"]
 async fn real_docker_edge_reuses_session_and_stop_removes_it() {
-    let config = super::RuntimeConfig::test_defaults();
+    let mut config = super::RuntimeConfig::test_defaults();
+    config.runtime_owner = format!("agentcore-edge-reuse-test-{}", uuid::Uuid::new_v4());
     let runtime_owner = config.runtime_owner.clone();
     let app = super::production_router(config)
         .await
@@ -944,6 +1049,7 @@ async fn real_docker_edge_reuses_session_and_stop_removes_it() {
             "unexpected Docker inspection error: {error}",
         );
     }
+    remove_owned_volumes(&docker, &runtime_owner).await;
 }
 
 #[tokio::test]
