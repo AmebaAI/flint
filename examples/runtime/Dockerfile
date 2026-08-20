@@ -1,6 +1,6 @@
 FROM oven/bun:1-alpine
 
-USER root
+USER 0
 RUN addgroup -S -g 10001 runtime \
     && adduser -S -D -H -u 10001 -G runtime runtime \
     && mkdir -p /workspace \
@@ -11,5 +11,6 @@ COPY --chown=10001:10001 server.ts /opt/runtime/server.ts
 USER 10001:10001
 WORKDIR /workspace
 EXPOSE 8080
-LABEL ai.ameba.flint.runtime.descriptor="{\"name\":\"example\",\"protocol\":\"HTTP\"}"
+LABEL ai.ameba.flint.runtime.name="example" \
+    ai.ameba.flint.runtime.protocol="HTTP"
 ENTRYPOINT ["bun", "/opt/runtime/server.ts"]

@@ -10,8 +10,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const MAX_RUNTIME_DESCRIPTOR_BYTES: usize = 16 * 1024;
-pub(crate) const RUNTIME_DESCRIPTOR_LABEL: &str = "ai.ameba.flint.runtime.descriptor";
+pub(crate) const RUNTIME_NAME_LABEL: &str = "ai.ameba.flint.runtime.name";
+pub(crate) const RUNTIME_PROTOCOL_LABEL: &str = "ai.ameba.flint.runtime.protocol";
+pub(crate) const RUNTIME_ENVIRONMENT_VARIABLES_LABEL: &str =
+    "ai.ameba.flint.runtime.environment-variables";
+pub(crate) const RUNTIME_IDLE_TIMEOUT_LABEL: &str =
+    "ai.ameba.flint.runtime.lifecycle.idle-runtime-session-timeout";
+pub(crate) const RUNTIME_MAX_LIFETIME_LABEL: &str = "ai.ameba.flint.runtime.lifecycle.max-lifetime";
 pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 pub(crate) const DEFAULT_ACCOUNT_ID: &str = "000000000000";
 pub(crate) const DEFAULT_QUALIFIER: &str = "DEFAULT";
@@ -479,17 +484,93 @@ pub(crate) struct DiscoveryPolicy {
 }
 
 pub(crate) fn parse_runtime_descriptor(
-    value: &str,
+    labels: &HashMap<String, String>,
 ) -> Result<RuntimeDescriptor, RuntimeDescriptorError> {
-    if value.len() > MAX_RUNTIME_DESCRIPTOR_BYTES {
-        return Err(RuntimeDescriptorError::TooLarge {
-            actual: value.len(),
-            maximum: MAX_RUNTIME_DESCRIPTOR_BYTES,
-        });
-    }
-    let descriptor: RuntimeDescriptor = serde_json::from_str(value)?;
+    let name = required_runtime_label(labels, RUNTIME_NAME_LABEL)?.to_owned();
+    let protocol_value = required_runtime_label(labels, RUNTIME_PROTOCOL_LABEL)?;
+    let protocol = match protocol_value {
+        "HTTP" => Protocol::Http,
+        "MCP" => Protocol::Mcp,
+        "A2A" => Protocol::A2a,
+        "AGUI" => Protocol::AgUi,
+        value => {
+            return Err(RuntimeDescriptorError::InvalidLabel {
+                label: RUNTIME_PROTOCOL_LABEL,
+                value: value.to_owned(),
+                reason: "must be one of HTTP, MCP, A2A, or AGUI".to_owned(),
+            });
+        }
+    };
+    let environment_variables = parse_environment_variables(labels)?;
+    let lifecycle_configuration = LifecycleConfigurationDocument {
+        idle_runtime_session_timeout: parse_optional_lifecycle_value(
+            labels,
+            RUNTIME_IDLE_TIMEOUT_LABEL,
+        )?,
+        max_lifetime: parse_optional_lifecycle_value(labels, RUNTIME_MAX_LIFETIME_LABEL)?,
+    };
+    let descriptor = RuntimeDescriptor {
+        name,
+        protocol,
+        environment_variables,
+        lifecycle_configuration,
+    };
     validate_runtime_descriptor(&descriptor)?;
     Ok(descriptor)
+}
+
+fn required_runtime_label<'a>(
+    labels: &'a HashMap<String, String>,
+    label: &'static str,
+) -> Result<&'a str, RuntimeDescriptorError> {
+    labels
+        .get(label)
+        .map(String::as_str)
+        .ok_or(RuntimeDescriptorError::MissingLabel { label })
+}
+
+fn parse_environment_variables(
+    labels: &HashMap<String, String>,
+) -> Result<Vec<String>, RuntimeDescriptorError> {
+    let Some(value) = labels.get(RUNTIME_ENVIRONMENT_VARIABLES_LABEL) else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .enumerate()
+        .map(|(index, name)| {
+            if name.is_empty() {
+                return Err(RuntimeDescriptorError::InvalidLabel {
+                    label: RUNTIME_ENVIRONMENT_VARIABLES_LABEL,
+                    value: value.clone(),
+                    reason: format!("entry {} is empty", index + 1),
+                });
+            }
+            Ok(name)
+        })
+        .collect()
+}
+
+fn parse_optional_lifecycle_value(
+    labels: &HashMap<String, String>,
+    label: &'static str,
+) -> Result<Option<u64>, RuntimeDescriptorError> {
+    let Some(value) = labels.get(label) else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error| RuntimeDescriptorError::InvalidLabel {
+            label,
+            value: value.clone(),
+            reason: format!("must be an unsigned integer: {error}"),
+        })
 }
 
 fn validate_runtime_descriptor(
@@ -1227,10 +1308,14 @@ fn empty_authorization_policy() -> AuthorizationPolicy {
 
 #[derive(Debug, Error)]
 pub(crate) enum RuntimeDescriptorError {
-    #[error("runtime descriptor is {actual} bytes; maximum is {maximum}")]
-    TooLarge { actual: usize, maximum: usize },
-    #[error("failed to parse runtime descriptor: {0}")]
-    Parse(#[from] serde_json::Error),
+    #[error("missing runtime label {label}")]
+    MissingLabel { label: &'static str },
+    #[error("invalid runtime label {label} value {value:?}: {reason}")]
+    InvalidLabel {
+        label: &'static str,
+        value: String,
+        reason: String,
+    },
     #[error("invalid runtime descriptor: {0}")]
     Validation(String),
 }
@@ -1262,16 +1347,6 @@ mod tests {
 
     use super::*;
 
-    const DESCRIPTOR: &str = r#"{
-      "name": "flint_local",
-      "protocol": "HTTP",
-      "environmentVariables": ["MODEL", "MISSING"],
-      "lifecycleConfiguration": {
-        "idleRuntimeSessionTimeout": 600,
-        "maxLifetime": 3600
-      }
-    }"#;
-
     const CATALOG: &str = r#"{
       "runtimes": [{
         "name": "flint_local",
@@ -1284,6 +1359,19 @@ mod tests {
         }
       }]
     }"#;
+
+    fn runtime_labels() -> HashMap<String, String> {
+        HashMap::from([
+            (RUNTIME_NAME_LABEL.to_owned(), "flint_local".to_owned()),
+            (RUNTIME_PROTOCOL_LABEL.to_owned(), "HTTP".to_owned()),
+            (
+                RUNTIME_ENVIRONMENT_VARIABLES_LABEL.to_owned(),
+                "MODEL,MISSING".to_owned(),
+            ),
+            (RUNTIME_IDLE_TIMEOUT_LABEL.to_owned(), "600".to_owned()),
+            (RUNTIME_MAX_LIFETIME_LABEL.to_owned(), "3600".to_owned()),
+        ])
+    }
 
     fn policy() -> DiscoveryPolicy {
         DiscoveryPolicy {
@@ -1348,31 +1436,105 @@ mod tests {
     }
 
     #[test]
-    fn minimal_descriptor_rejects_legacy_and_invalid_fields() {
-        let descriptor = parse_runtime_descriptor(DESCRIPTOR).expect("minimal descriptor");
+    fn runtime_labels_parse_into_a_descriptor() {
+        let mut labels = runtime_labels();
+        let descriptor = parse_runtime_descriptor(&labels).expect("runtime labels");
         assert_eq!(descriptor.name, "flint_local");
         assert_eq!(descriptor.protocol, Protocol::Http);
-        for extra in [
-            r#", "protocolPort": 8080"#,
-            r#", "invocationPath": "/invocations""#,
-            r#", "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/flint_local""#,
-            r#", "requestedHeaders": []"#,
-        ] {
-            let invalid = DESCRIPTOR.replacen("\n    }", &format!("{extra}\n    }}"), 1);
-            assert!(matches!(
-                parse_runtime_descriptor(&invalid),
-                Err(RuntimeDescriptorError::Parse(_))
-            ));
-        }
-        let duplicate = DESCRIPTOR.replace(r#"["MODEL", "MISSING"]"#, r#"["MODEL", "MODEL"]"#);
+        assert_eq!(descriptor.environment_variables, ["MODEL", "MISSING"]);
+        assert_eq!(
+            descriptor
+                .lifecycle_configuration
+                .idle_runtime_session_timeout,
+            Some(600)
+        );
+        assert_eq!(descriptor.lifecycle_configuration.max_lifetime, Some(3600));
+
+        labels.remove(RUNTIME_ENVIRONMENT_VARIABLES_LABEL);
+        labels.remove(RUNTIME_IDLE_TIMEOUT_LABEL);
+        labels.remove(RUNTIME_MAX_LIFETIME_LABEL);
+        let minimal = parse_runtime_descriptor(&labels).expect("minimal runtime labels");
+        assert!(minimal.environment_variables.is_empty());
+        assert!(
+            minimal
+                .lifecycle_configuration
+                .idle_runtime_session_timeout
+                .is_none()
+        );
+        assert!(minimal.lifecycle_configuration.max_lifetime.is_none());
+    }
+
+    #[test]
+    fn runtime_labels_reject_missing_and_invalid_values() {
+        let mut labels = runtime_labels();
+        labels.remove(RUNTIME_NAME_LABEL);
         assert!(matches!(
-            parse_runtime_descriptor(&duplicate),
+            parse_runtime_descriptor(&labels),
+            Err(RuntimeDescriptorError::MissingLabel {
+                label: RUNTIME_NAME_LABEL
+            })
+        ));
+
+        let mut labels = runtime_labels();
+        labels.remove(RUNTIME_PROTOCOL_LABEL);
+        assert!(matches!(
+            parse_runtime_descriptor(&labels),
+            Err(RuntimeDescriptorError::MissingLabel {
+                label: RUNTIME_PROTOCOL_LABEL
+            })
+        ));
+
+        let mut labels = runtime_labels();
+        labels.insert(RUNTIME_PROTOCOL_LABEL.to_owned(), "GRPC".to_owned());
+        assert!(matches!(
+            parse_runtime_descriptor(&labels),
+            Err(RuntimeDescriptorError::InvalidLabel {
+                label: RUNTIME_PROTOCOL_LABEL,
+                ..
+            })
+        ));
+
+        let mut labels = runtime_labels();
+        labels.insert(
+            RUNTIME_ENVIRONMENT_VARIABLES_LABEL.to_owned(),
+            "MODEL,,MISSING".to_owned(),
+        );
+        assert!(matches!(
+            parse_runtime_descriptor(&labels),
+            Err(RuntimeDescriptorError::InvalidLabel {
+                label: RUNTIME_ENVIRONMENT_VARIABLES_LABEL,
+                ..
+            })
+        ));
+
+        let mut labels = runtime_labels();
+        labels.insert(
+            RUNTIME_IDLE_TIMEOUT_LABEL.to_owned(),
+            "not-a-number".to_owned(),
+        );
+        assert!(matches!(
+            parse_runtime_descriptor(&labels),
+            Err(RuntimeDescriptorError::InvalidLabel {
+                label: RUNTIME_IDLE_TIMEOUT_LABEL,
+                ..
+            })
+        ));
+
+        let mut labels = runtime_labels();
+        labels.insert(RUNTIME_IDLE_TIMEOUT_LABEL.to_owned(), "59".to_owned());
+        assert!(matches!(
+            parse_runtime_descriptor(&labels),
             Err(RuntimeDescriptorError::Validation(_))
         ));
-        let oversized = "x".repeat(MAX_RUNTIME_DESCRIPTOR_BYTES + 1);
+
+        let mut labels = runtime_labels();
+        labels.insert(
+            RUNTIME_ENVIRONMENT_VARIABLES_LABEL.to_owned(),
+            "MODEL,MODEL".to_owned(),
+        );
         assert!(matches!(
-            parse_runtime_descriptor(&oversized),
-            Err(RuntimeDescriptorError::TooLarge { .. })
+            parse_runtime_descriptor(&labels),
+            Err(RuntimeDescriptorError::Validation(_))
         ));
     }
 
@@ -1425,7 +1587,7 @@ mod tests {
 
     #[test]
     fn discovered_runtime_uses_immutable_image_and_rejects_duplicate_names() {
-        let descriptor = parse_runtime_descriptor(DESCRIPTOR).expect("descriptor");
+        let descriptor = parse_runtime_descriptor(&runtime_labels()).expect("descriptor");
         let catalog = RuntimeCatalog::from_discovered_images(
             vec![discovered_image(
                 "sha256:immutable",

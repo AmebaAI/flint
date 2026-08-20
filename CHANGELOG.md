@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking:** Docker-discovered runtime images now use separate name and
+  protocol labels instead of the JSON runtime descriptor label.
 - Updated the Compose example to use the latest published GHCR image instead
   of building Flint locally.
 - Distributed release images across native AMD64 and ARM64 runners, added
