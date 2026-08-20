@@ -43,8 +43,8 @@ use crate::runtime::{
 use crate::{
     catalog::{
         Connectivity, ConnectivityMode, DiscoveredRuntimeImage, DiscoveryPolicy,
-        RUNTIME_NAME_LABEL, ResolvedImage, ResolvedRuntime, RuntimeCatalog, RuntimeRegistry,
-        parse_runtime_descriptor,
+        RUNTIME_PROTOCOL_LABEL, ResolvedImage, ResolvedRuntime, RuntimeCatalog, RuntimeRegistry,
+        parse_runtime_descriptor, runtime_name_from_image,
     },
     config::DockerDiscoveryConfig,
     session::{
@@ -565,7 +565,7 @@ async fn discover_runtime_catalog(
             .list_images(Some(ListImagesOptionsBuilder::default().all(true).build()))
             .await?;
         for image in images {
-            if !image.labels.contains_key(RUNTIME_NAME_LABEL) {
+            if !image.labels.contains_key(RUNTIME_PROTOCOL_LABEL) {
                 continue;
             }
             let inspection = docker.inspect_image(&image.id).await.map_err(|error| {
@@ -640,10 +640,11 @@ fn insert_discovered_image(
         .and_then(|config| config.labels.as_ref())
         .ok_or_else(|| {
             DockerBackendError::Discovery(format!(
-                "selected image {image_reference} has no {RUNTIME_NAME_LABEL} label"
+                "selected image {image_reference} has no runtime labels"
             ))
         })?;
-    let descriptor = parse_runtime_descriptor(labels).map_err(|error| {
+    let default_name = runtime_name_from_image(&image_reference);
+    let descriptor = parse_runtime_descriptor(labels, &default_name).map_err(|error| {
         DockerBackendError::Discovery(format!(
             "image {image_reference} has invalid runtime labels: {error}"
         ))
