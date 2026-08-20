@@ -45,7 +45,10 @@ curl --fail-with-body \
 
 FLINT_SESSION_ID=$(
   awk -F ': *' \
-    'tolower($1) == "x-amzn-bedrock-agentcore-runtime-session-id" { sub(/\r$/, "", $2); print $2 }' \
+    'tolower($1) == "x-amzn-bedrock-agentcore-runtime-session-id" {
+       sub(/\r$/, "", $2)
+       print $2
+     }' \
     "$FLINT_HEADERS"
 )
 rm "$FLINT_HEADERS"
@@ -134,19 +137,26 @@ docker compose -f compose.example.yml down
 
 ## Runtime images
 
-Flint discovers local Docker images with an
-`ai.ameba.flint.runtime.descriptor` label. The example image uses the smallest
-valid descriptor:
+Flint discovers local Docker images with these required labels:
 
-```json
-{
-  "name": "example",
-  "protocol": "HTTP"
-}
+```dockerfile
+LABEL ai.ameba.flint.runtime.name="example" \
+    ai.ameba.flint.runtime.protocol="HTTP"
 ```
 
-The runtime name becomes its local runtime ID. Every runtime has one qualifier,
-`DEFAULT`.
+Optional runtime labels configure requested environment variables and lifecycle
+values:
+
+```dockerfile
+LABEL ai.ameba.flint.runtime.environment-variables="MODEL,API_KEY" \
+    ai.ameba.flint.runtime.lifecycle.idle-runtime-session-timeout="900" \
+    ai.ameba.flint.runtime.lifecycle.max-lifetime="28800"
+```
+
+The environment-variable label is a comma-separated list. Missing optional
+labels use Flint's defaults. The runtime name becomes its local runtime ID.
+
+Every runtime has one qualifier, `DEFAULT`.
 
 AgentCore fixes the port and routes for each protocol. Flint does not let image
 metadata override them.

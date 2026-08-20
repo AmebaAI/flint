@@ -31,7 +31,12 @@ A Runtime is the logical service identified by a runtime ID or ARN. A Runtime
 declaration can come from either:
 
 - A JSON catalog
-- Docker image discovery using the `ai.ameba.flint.runtime.descriptor` label
+- Docker image discovery using runtime labels:
+  - `ai.ameba.flint.runtime.name`
+  - `ai.ameba.flint.runtime.protocol`
+  - `ai.ameba.flint.runtime.environment-variables` (optional)
+  - `ai.ameba.flint.runtime.lifecycle.idle-runtime-session-timeout` (optional)
+  - `ai.ameba.flint.runtime.lifecycle.max-lifetime` (optional)
 
 The input declaration is intentionally minimal:
 
@@ -87,8 +92,8 @@ See `src/docker.rs:825-867` and `src/catalog.rs:759-801`.
 
 ### Image discovery
 
-Docker discovery combines image metadata with a runtime descriptor. The
-resulting discovered image includes:
+Docker discovery combines image metadata with runtime labels normalized into a
+Runtime descriptor. The resulting discovered image includes:
 
 - Image ID
 - Platform

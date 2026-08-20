@@ -43,7 +43,7 @@ use crate::runtime::{
 use crate::{
     catalog::{
         Connectivity, ConnectivityMode, DiscoveredRuntimeImage, DiscoveryPolicy,
-        RUNTIME_DESCRIPTOR_LABEL, ResolvedImage, ResolvedRuntime, RuntimeCatalog, RuntimeRegistry,
+        RUNTIME_NAME_LABEL, ResolvedImage, ResolvedRuntime, RuntimeCatalog, RuntimeRegistry,
         parse_runtime_descriptor,
     },
     config::DockerDiscoveryConfig,
@@ -565,7 +565,7 @@ async fn discover_runtime_catalog(
             .list_images(Some(ListImagesOptionsBuilder::default().all(true).build()))
             .await?;
         for image in images {
-            if !image.labels.contains_key(RUNTIME_DESCRIPTOR_LABEL) {
+            if !image.labels.contains_key(RUNTIME_NAME_LABEL) {
                 continue;
             }
             let inspection = docker.inspect_image(&image.id).await.map_err(|error| {
@@ -634,18 +634,18 @@ fn insert_discovered_image(
     let image_working_directory = image_config
         .and_then(|config| config.working_dir.clone())
         .filter(|directory| !directory.is_empty());
-    let descriptor_value = inspection
+    let labels = inspection
         .config
-        .and_then(|config| config.labels)
-        .and_then(|labels| labels.get(RUNTIME_DESCRIPTOR_LABEL).cloned())
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
         .ok_or_else(|| {
             DockerBackendError::Discovery(format!(
-                "selected image {image_reference} has no {RUNTIME_DESCRIPTOR_LABEL} label"
+                "selected image {image_reference} has no {RUNTIME_NAME_LABEL} label"
             ))
         })?;
-    let descriptor = parse_runtime_descriptor(&descriptor_value).map_err(|error| {
+    let descriptor = parse_runtime_descriptor(labels).map_err(|error| {
         DockerBackendError::Discovery(format!(
-            "image {image_reference} has an invalid {RUNTIME_DESCRIPTOR_LABEL} label: {error}"
+            "image {image_reference} has invalid runtime labels: {error}"
         ))
     })?;
     match candidates.entry(content_id) {
