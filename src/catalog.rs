@@ -425,7 +425,8 @@ struct CatalogDocument {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RuntimeDocument {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
     image: String,
     protocol: Protocol,
     #[serde(default)]
@@ -485,8 +486,11 @@ pub(crate) struct DiscoveryPolicy {
 
 pub(crate) fn parse_runtime_descriptor(
     labels: &HashMap<String, String>,
+    default_name: &str,
 ) -> Result<RuntimeDescriptor, RuntimeDescriptorError> {
-    let name = required_runtime_label(labels, RUNTIME_NAME_LABEL)?.to_owned();
+    let name = labels
+        .get(RUNTIME_NAME_LABEL)
+        .map_or_else(|| default_name.to_owned(), Clone::clone);
     let protocol_value = required_runtime_label(labels, RUNTIME_PROTOCOL_LABEL)?;
     let protocol = match protocol_value {
         "HTTP" => Protocol::Http,
@@ -527,6 +531,12 @@ fn required_runtime_label<'a>(
         .get(label)
         .map(String::as_str)
         .ok_or(RuntimeDescriptorError::MissingLabel { label })
+}
+
+pub(crate) fn runtime_name_from_image(image: &str) -> String {
+    let image = image.trim().split('@').next().unwrap_or_default();
+    let image = image.rsplit('/').next().unwrap_or(image);
+    image.split(':').next().unwrap_or(image).to_owned()
 }
 
 fn parse_environment_variables(
@@ -934,32 +944,34 @@ impl RuntimeCatalog {
         let mut generation_values = policy_generation_values(policy);
         let mut runtimes = Vec::with_capacity(document.runtimes.len());
         for runtime in document.runtimes {
-            if !runtime_names.insert(runtime.name.clone()) {
-                return Err(CatalogError::Validation(format!(
-                    "duplicate runtime name {}",
-                    runtime.name
-                )));
+            let image = runtime.image;
+            if image.trim().is_empty() {
+                return Err(CatalogError::Validation(
+                    "runtime has an empty image".to_owned(),
+                ));
             }
-            if runtime.image.trim().is_empty() {
+            let name = runtime
+                .name
+                .unwrap_or_else(|| runtime_name_from_image(&image));
+            if !runtime_names.insert(name.clone()) {
                 return Err(CatalogError::Validation(format!(
-                    "runtime {} has an empty image",
-                    runtime.name
+                    "duplicate runtime name {name}"
                 )));
             }
             let lifecycle = validate_runtime_declaration(
-                &runtime.name,
+                &name,
                 &runtime.environment_variables,
                 &runtime.lifecycle_configuration,
             )
             .map_err(CatalogError::Validation)?;
             let (resolved_environment, environment_warnings) = resolve_requested_environment(
-                &runtime.name,
+                &name,
                 &runtime.environment_variables,
                 &environment_allowlist,
                 &environment,
                 &mut generation_values,
             );
-            let runtime_id = runtime.name;
+            let runtime_id = name;
             let runtime_arn = local_runtime_arn(DEFAULT_REGION, DEFAULT_ACCOUNT_ID, &runtime_id);
             let resolved = Arc::new(ResolvedRuntime {
                 catalog_generation: String::new(),
@@ -967,7 +979,7 @@ impl RuntimeCatalog {
                 runtime_id: runtime_id.clone(),
                 account_id: DEFAULT_ACCOUNT_ID.to_owned(),
                 qualifier: DEFAULT_QUALIFIER.to_owned(),
-                image: runtime.image,
+                image,
                 image_id: String::new(),
                 image_platform: String::new(),
                 image_entrypoint: None,
@@ -1239,9 +1251,9 @@ fn valid_runtime_id(value: &str) -> bool {
             .bytes()
             .next()
             .is_some_and(|character| character.is_ascii_alphabetic())
-        && value
-            .bytes()
-            .all(|character| character.is_ascii_alphanumeric() || character == b'_')
+        && value.bytes().all(|character| {
+            character.is_ascii_alphanumeric() || character == b'_' || character == b'-'
+        })
 }
 
 fn validate_environment_name(label: &str, value: &str) -> Result<(), CatalogError> {
@@ -1436,9 +1448,30 @@ mod tests {
     }
 
     #[test]
+    fn image_names_provide_runtime_name_defaults() {
+        assert_eq!(
+            runtime_name_from_image("ghcr.io/acme/my-runtime:latest"),
+            "my-runtime"
+        );
+        assert_eq!(
+            runtime_name_from_image("my-runtime@sha256:abc"),
+            "my-runtime"
+        );
+
+        let catalog = RuntimeCatalog::from_bytes_with_environment(
+            Path::new("catalog.json"),
+            br#"{"runtimes":[{"image":"ghcr.io/acme/my-runtime:latest","protocol":"HTTP"}]}"#,
+            &policy(),
+            |_| None,
+        )
+        .expect("catalog with default runtime name");
+        assert_eq!(catalog.default_snapshot().runtime_id, "my-runtime");
+    }
+
+    #[test]
     fn runtime_labels_parse_into_a_descriptor() {
         let mut labels = runtime_labels();
-        let descriptor = parse_runtime_descriptor(&labels).expect("runtime labels");
+        let descriptor = parse_runtime_descriptor(&labels, "fallback").expect("runtime labels");
         assert_eq!(descriptor.name, "flint_local");
         assert_eq!(descriptor.protocol, Protocol::Http);
         assert_eq!(descriptor.environment_variables, ["MODEL", "MISSING"]);
@@ -1453,7 +1486,8 @@ mod tests {
         labels.remove(RUNTIME_ENVIRONMENT_VARIABLES_LABEL);
         labels.remove(RUNTIME_IDLE_TIMEOUT_LABEL);
         labels.remove(RUNTIME_MAX_LIFETIME_LABEL);
-        let minimal = parse_runtime_descriptor(&labels).expect("minimal runtime labels");
+        let minimal =
+            parse_runtime_descriptor(&labels, "fallback").expect("minimal runtime labels");
         assert!(minimal.environment_variables.is_empty());
         assert!(
             minimal
@@ -1465,20 +1499,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_labels_reject_missing_and_invalid_values() {
+    fn runtime_labels_default_the_name_and_reject_invalid_values() {
         let mut labels = runtime_labels();
         labels.remove(RUNTIME_NAME_LABEL);
-        assert!(matches!(
-            parse_runtime_descriptor(&labels),
-            Err(RuntimeDescriptorError::MissingLabel {
-                label: RUNTIME_NAME_LABEL
-            })
-        ));
+        let descriptor = parse_runtime_descriptor(&labels, "my-runtime").expect("default name");
+        assert_eq!(descriptor.name, "my-runtime");
 
         let mut labels = runtime_labels();
         labels.remove(RUNTIME_PROTOCOL_LABEL);
         assert!(matches!(
-            parse_runtime_descriptor(&labels),
+            parse_runtime_descriptor(&labels, "fallback"),
             Err(RuntimeDescriptorError::MissingLabel {
                 label: RUNTIME_PROTOCOL_LABEL
             })
@@ -1487,7 +1517,7 @@ mod tests {
         let mut labels = runtime_labels();
         labels.insert(RUNTIME_PROTOCOL_LABEL.to_owned(), "GRPC".to_owned());
         assert!(matches!(
-            parse_runtime_descriptor(&labels),
+            parse_runtime_descriptor(&labels, "fallback"),
             Err(RuntimeDescriptorError::InvalidLabel {
                 label: RUNTIME_PROTOCOL_LABEL,
                 ..
@@ -1500,7 +1530,7 @@ mod tests {
             "MODEL,,MISSING".to_owned(),
         );
         assert!(matches!(
-            parse_runtime_descriptor(&labels),
+            parse_runtime_descriptor(&labels, "fallback"),
             Err(RuntimeDescriptorError::InvalidLabel {
                 label: RUNTIME_ENVIRONMENT_VARIABLES_LABEL,
                 ..
@@ -1513,7 +1543,7 @@ mod tests {
             "not-a-number".to_owned(),
         );
         assert!(matches!(
-            parse_runtime_descriptor(&labels),
+            parse_runtime_descriptor(&labels, "fallback"),
             Err(RuntimeDescriptorError::InvalidLabel {
                 label: RUNTIME_IDLE_TIMEOUT_LABEL,
                 ..
@@ -1523,7 +1553,7 @@ mod tests {
         let mut labels = runtime_labels();
         labels.insert(RUNTIME_IDLE_TIMEOUT_LABEL.to_owned(), "59".to_owned());
         assert!(matches!(
-            parse_runtime_descriptor(&labels),
+            parse_runtime_descriptor(&labels, "fallback"),
             Err(RuntimeDescriptorError::Validation(_))
         ));
 
@@ -1533,7 +1563,7 @@ mod tests {
             "MODEL,MODEL".to_owned(),
         );
         assert!(matches!(
-            parse_runtime_descriptor(&labels),
+            parse_runtime_descriptor(&labels, "fallback"),
             Err(RuntimeDescriptorError::Validation(_))
         ));
     }
@@ -1587,7 +1617,8 @@ mod tests {
 
     #[test]
     fn discovered_runtime_uses_immutable_image_and_rejects_duplicate_names() {
-        let descriptor = parse_runtime_descriptor(&runtime_labels()).expect("descriptor");
+        let descriptor =
+            parse_runtime_descriptor(&runtime_labels(), "fallback").expect("descriptor");
         let catalog = RuntimeCatalog::from_discovered_images(
             vec![discovered_image(
                 "sha256:immutable",

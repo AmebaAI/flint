@@ -137,11 +137,16 @@ docker compose -f compose.example.yml down
 
 ## Runtime images
 
-Flint discovers local Docker images with these required labels:
+Flint discovers local Docker images with a runtime protocol label:
 
 ```dockerfile
-LABEL ai.ameba.flint.runtime.name="example" \
-    ai.ameba.flint.runtime.protocol="HTTP"
+LABEL ai.ameba.flint.runtime.protocol="HTTP"
+```
+
+The optional runtime name label overrides the image-name default:
+
+```dockerfile
+LABEL ai.ameba.flint.runtime.name="example"
 ```
 
 Optional runtime labels configure requested environment variables and lifecycle
@@ -154,7 +159,10 @@ LABEL ai.ameba.flint.runtime.environment-variables="MODEL,API_KEY" \
 ```
 
 The environment-variable label is a comma-separated list. Missing optional
-labels use Flint's defaults. The runtime name becomes its local runtime ID.
+labels use Flint's defaults. If the name label is absent, Flint uses the final
+repository component of the image name, without its tag or digest, as the local
+runtime ID. For example, `ghcr.io/acme/my-runtime:latest` becomes
+`my-runtime`.
 
 Every runtime has one qualifier, `DEFAULT`.
 
@@ -201,7 +209,8 @@ daemon; Flint never pulls them. The main settings are:
 
 For file-based configuration, set `AGENTCORE_RUNTIME_SOURCE=catalog` and use
 [`config/runtime-catalog.example.json`](config/runtime-catalog.example.json).
-Catalog entries use the descriptor fields plus `image`.
+Catalog entries use the descriptor fields plus `image`; `name` is optional and
+defaults to the final repository component of the image name.
 
 ## Identity and sessions
 

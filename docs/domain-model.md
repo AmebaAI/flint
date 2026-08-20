@@ -32,15 +32,15 @@ declaration can come from either:
 
 - A JSON catalog
 - Docker image discovery using runtime labels:
-  - `ai.ameba.flint.runtime.name`
   - `ai.ameba.flint.runtime.protocol`
+  - `ai.ameba.flint.runtime.name` (optional; defaults to the image name)
   - `ai.ameba.flint.runtime.environment-variables` (optional)
   - `ai.ameba.flint.runtime.lifecycle.idle-runtime-session-timeout` (optional)
   - `ai.ameba.flint.runtime.lifecycle.max-lifetime` (optional)
 
 The input declaration is intentionally minimal:
 
-- Runtime name
+- Runtime name, defaulting to the image name when omitted
 - Image reference
 - Protocol
 - Requested environment variable names
