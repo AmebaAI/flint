@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.2.0] - 2026-08-20
+
+### Added
+
+### Changed
+
 - Docker runtime names now default to the image name when omitted from labels or
   catalog entries.
 - **Breaking:** Docker-discovered runtime images now use separate name and
