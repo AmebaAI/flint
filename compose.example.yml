@@ -1,9 +1,6 @@
 services:
   flint:
-    image: flint:local
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/amebaai/flint:latest
     environment:
       PORT: "8080"
       AGENTCORE_RUNTIME_SOURCE: docker
