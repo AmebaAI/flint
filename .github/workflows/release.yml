@@ -239,6 +239,7 @@ jobs:
       contents: read
       packages: write
     env:
+      SCOPE: flint-release-${{ matrix.arch }}
       IMAGE: ${{ needs.prepare-release.outputs.image }}
       RELEASE_SHA: ${{ needs.prepare-release.outputs.sha }}
       SOURCE: ${{ github.server_url }}/${{ github.repository }}
@@ -296,8 +297,8 @@ jobs:
             org.opencontainers.image.revision=${{ env.RELEASE_SHA }}
             org.opencontainers.image.source=${{ env.SOURCE }}
           outputs: ${{ steps.output.outputs.value }}
-          cache-from: type=gha,scope=flint-release-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=flint-release-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ env.SCOPE }}
+          cache-to: type=gha,mode=max,ignore-error=true,scope=${{ env.SCOPE }}
 
       - name: Export image digest
         shell: bash
