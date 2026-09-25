@@ -46,7 +46,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-aws-sdk-bedrockagentcore = { version = "=1.60.0", default-features = false, features = [
+aws-sdk-bedrockagentcore = { version = "=1.67.0", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
 ] }
