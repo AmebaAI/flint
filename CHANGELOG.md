@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- Update `rustls` to 0.23.45 to address RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption level boundaries).
+- Update the `debian:bookworm-slim` runtime base image to pick up the patched `libpcre2-8-0` (CVE-2026-86145, CVE-2026-89157, CVE-2026-89161).
+- Add Dependabot configuration for Cargo, GitHub Actions, and Docker base images so these updates arrive automatically.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added
