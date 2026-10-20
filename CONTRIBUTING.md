@@ -6,7 +6,7 @@ Thank you for contributing to Flint.
 
 - Discuss substantial behavior or public configuration changes in an issue.
 - Keep changes focused and avoid unrelated cleanup.
-- Add user-visible changes to the Unreleased section of `CHANGELOG.md`.
+- Record user-visible changes with momo (`momo add`, `momo fix`, or `momo break`), which owns the Unreleased section of `CHANGELOG.md`.
 - Report security issues privately as described in `SECURITY.md`.
 
 ## Local setup
@@ -41,6 +41,12 @@ Pull requests should:
 
 The project uses squash merges and requires an approving review from the code
 owners.
+
+## Releasing
+
+Releases are cut by dispatching the `Release` workflow. The versioning model,
+when to dry-run, and recovery from a partial release are in
+[`docs/releasing.md`](docs/releasing.md).
 
 ## License
 

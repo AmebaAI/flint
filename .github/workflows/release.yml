@@ -1,18 +1,30 @@
 name: Release Flint
 
+# Owner-controlled release. Dispatch it with no inputs and momo derives the
+# next version from the Unreleased CHANGELOG entries, writes the changelog, the
+# version ledger and the Cargo.toml scalar, and opens a `release/vX.Y.Z` pull
+# request. `main` requires a pull request, so the bump lands through that PR;
+# merging it tags the release, builds the multi-platform images, and cuts the
+# GitHub Release. Dispatch with `version` + `commit` to recover or republish an
+# existing release instead.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, closed]
   workflow_dispatch:
     inputs:
       version:
-        description: Existing release version to recover or republish
-        required: true
+        description: Existing release version to recover or republish; leave empty to mint a new release
+        required: false
         type: string
       commit:
-        description: Merged commit SHA to publish
-        required: true
+        description: Merged commit SHA to publish (recovery only, with version)
+        required: false
         type: string
+      dry_run:
+        description: Mint locally and stop before committing, pushing, tagging, or releasing
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
 
 permissions:
   contents: read
@@ -22,6 +34,98 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  mint-release:
+    name: Mint the release
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.version == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out mainline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # momo reads the current version from the tags.
+          fetch-depth: 0
+
+      - name: Install toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518
+        with:
+          cache: false
+
+      - name: Derive the next version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! momo status --check >/dev/null 2>&1; then
+            echo "error: nothing unreleased - record a change with 'momo break|add|fix'" >&2
+            exit 1
+          fi
+          version="$(momo status --version-only)"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "error: tag v$version already exists" >&2
+            exit 1
+          fi
+          echo "derived $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Mint the release
+        # momo writes CHANGELOG.md, .momo/version and the Cargo.toml version
+        # scalar. It never touches Cargo.lock, so sync it here: the commit below
+        # must carry a lockfile that agrees with the manifest.
+        run: |
+          set -euo pipefail
+          momo release
+          cargo metadata --format-version 1 >/dev/null
+
+      - name: Summarise the dry run
+        if: inputs.dry_run
+        run: |
+          echo "dry run: would release ${{ steps.version.outputs.version }}"
+          git --no-pager diff --stat
+
+      - name: Run the verification gate
+        if: ${{ !inputs.dry_run }}
+        run: mise run check
+
+      - name: Open the release pull request
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          branch="release/v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add Cargo.toml Cargo.lock CHANGELOG.md .momo/version
+          git commit -m "Release Flint v$VERSION"
+          git push origin "$branch"
+
+          awk -v version="$VERSION" '
+            BEGIN { header = "## [" version "] - " }
+            index($0, header) == 1 { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/flint-release-notes.md
+          test -s /tmp/flint-release-notes.md
+          {
+            printf 'Release Flint v%s.\n\n' "$VERSION"
+            printf 'Minted by momo from the Unreleased changelog entries. Merging this PR tags the release and publishes the images.\n\n'
+            cat /tmp/flint-release-notes.md
+          } > /tmp/flint-release-pr-body.md
+
+          gh pr create -R "$GITHUB_REPOSITORY" \
+            --base main --head "$branch" \
+            --title "Release Flint v$VERSION" \
+            --body-file /tmp/flint-release-pr-body.md
+
   validate-release-pr:
     if: >-
       github.event_name == 'pull_request' &&
@@ -104,7 +208,8 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       startsWith(github.event.pull_request.head.ref, 'release/v')) ||
-      github.event_name == 'workflow_dispatch'
+      (github.event_name == 'workflow_dispatch' &&
+      inputs.version != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: release
@@ -211,6 +316,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Created through the API rather than `momo tag` so the recovery dispatch
+      # (which republishes a version whose tag already exists) stays idempotent.
       - name: Create or verify release tag
         shell: bash
         env:

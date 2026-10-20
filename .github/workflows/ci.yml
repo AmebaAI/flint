@@ -75,7 +75,7 @@ jobs:
                   rust=true
                 fi
                 ;;
-              README.md|CHANGELOG.md|CONTRIBUTING.md|SECURITY.md|LICENSE|.github/CODEOWNERS|.agents/*|docs/*)
+              README.md|CHANGELOG.md|CONTRIBUTING.md|SECURITY.md|LICENSE|.github/CODEOWNERS|.agents/*|docs/*|momo.toml|.momo/*)
                 ;;
               Cargo.toml|Cargo.lock|*/Cargo.toml)
                 container=true

@@ -16,16 +16,13 @@ Use Jujutsu only. Never invoke Git directly.
 
 ## Changelog
 
-For a user-visible change, add a concise entry under `CHANGELOG.md` -> `## [Unreleased]` in the appropriate category:
+For a user-visible change, record it with momo, which owns the changelog heading and the section it lands in:
 
-- `Added` for new behavior
-- `Changed` for changed behavior, including an explicit `**Breaking:**` marker when incompatible
-- `Deprecated` for behavior scheduled for removal
-- `Removed` for removed behavior
-- `Fixed` for bug fixes
-- `Security` for security fixes
+- `momo break "<description>"` for an incompatible change
+- `momo add "<description>"` for new, backwards-compatible behavior
+- `momo fix "<description>"` for a backwards-compatible bug fix
 
-Describe what users observe, not implementation details. Do not bump the Cargo version during an ordinary landing. Skip changelog edits for pure refactors, tests, formatting, and non-behavioral maintenance.
+Describe what users observe, not implementation details. Do not bump the Cargo version during an ordinary landing: momo derives the version from the unreleased changes at release time. Skip changelog edits for pure refactors, tests, formatting, and non-behavioral maintenance.
 
 ## Landing
 

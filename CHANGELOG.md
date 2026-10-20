@@ -1,23 +1,36 @@
 # Changelog
 
-All notable changes to Flint will be documented in this file.
+All notable changes to Flint are documented here, newest first, managed by
+[momo](https://github.com/Jarvvski/momo).
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/).
+Unreleased changes live under `## [Unreleased]`, grouped by kind:
+
+- `### Breaking` - an incompatible change
+- `### Added` - new functionality, backwards compatible
+- `### Fixed` - a backwards-compatible bug fix
+
+Record a change with `momo break|add|fix "<description>"`; momo owns the heading
+and the section it lands in. `momo status` derives the next version from the
+unreleased changes and the latest tag, and the release workflow runs `momo
+release` and tags the release, so **do not bump the version by hand**. See
+[docs/releasing.md](docs/releasing.md).
+
+Flint is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.2.0`
+means `>=0.2.0, <0.3.0`): `break` and `add` both raise the minor, `fix` raises
+the patch. That is momo's zero-aware rule. A 1.0.0 release needs the owner's
+explicit approval.
+
+Sections released before the momo adoption use Keep a Changelog headings
+(`Changed`, `Deprecated`, `Removed`, `Security`); they are preserved as history
+and carry no meaning now.
 
 ## [Unreleased]
 
+### Breaking
+
 ### Added
 
-### Changed
-
-### Deprecated
-
-### Removed
-
 ### Fixed
-
-### Security
 
 - Update `rustls` to 0.23.46 to address RUSTSEC-2026-0285 and RUSTSEC-2026-0346 through RUSTSEC-2026-0349.
 - Update the `debian:bookworm-slim` runtime base image to pick up the patched `libpcre2-8-0` (CVE-2026-86145, CVE-2026-89157, CVE-2026-89161).

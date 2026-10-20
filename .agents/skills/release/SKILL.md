@@ -1,49 +1,32 @@
 ---
 name: release
-description: Prepare a Flint release pull request by computing the SemVer bump from Unreleased changelog entries, updating the manifest and changelog, and opening a guarded release PR. Use when asked to release Flint.
+description: Cut a Flint release by dispatching the Release workflow, which mints the version with momo and opens a release pull request for the owner to review and merge. Use when asked to release Flint.
 license: GPL-3.0
 ---
 
-# Prepare a Flint release
+# Cut a Flint release
 
-Use Jujutsu only. Never invoke Git directly. This skill prepares and pushes a release PR; it never merges, tags, publishes packages, or creates a GitHub Release locally.
+Use Jujutsu only. Never invoke Git directly.
+
+Releasing is owner-controlled. The `Release` workflow mints the version with momo and opens a `release/vX.Y.Z` pull request; merging that PR tags the release and publishes the images. This skill dispatches the workflow and reports back — it never bumps the version, edits the changelog, tags, merges, or publishes anything itself.
 
 ## Preconditions
 
-- The working copy is clean before starting.
-- The latest mainline is fetched and the release is based on it.
-- A root `Cargo.toml` package named `flint` exists. Until source migration supplies it, stop and report that release preparation is unavailable.
-- `CHANGELOG.md` contains at least one non-empty entry under `## [Unreleased]`.
-- No existing release tag or GitHub Release uses the computed version.
-- No other open Flint release PR is being prepared.
+- `CHANGELOG.md` has at least one non-empty entry under `## [Unreleased]`; `momo status` reports the version it would mint.
+- The working copy is clean and the latest mainline is fetched.
+- No Flint release pull request is already open.
 
-## Compute the version
+## Dispatch the release
 
-Read all populated `Unreleased` categories and compute the highest required bump:
+1. Confirm there is something to release: run `momo status` and read the `→ next:` version.
+2. Dispatch the workflow from the default branch: `gh workflow run release.yml -R AmebaAI/flint`.
+   - Add `-f dry_run=true` only when the release process itself changed; it mints locally and stops before committing, pushing, or releasing.
+   - To recover or republish an existing release, pass `-f version=<x.y.z> -f commit=<sha>`.
+3. Watch it: `gh run watch -R AmebaAI/flint`.
+4. Report the release pull request the run opens. The owner reviews and merges it; the merge tags the release, builds the multi-platform GHCR images, and creates the GitHub Release.
 
-- `Fixed` and `Security` only: PATCH
-- Any `Added`, `Changed`, or `Deprecated`: MINOR
-- `Removed` or an explicit `**Breaking:**` entry: MINOR while the current version is `0.x`
-- At `1.x` and later, `Removed` or explicitly breaking entries: MAJOR
-- A `0.x` to `1.0.0` transition always requires explicit owner approval
-
-Use the manifest version as the version of record. If the current version is `0.0.0`, the first feature release is `0.1.0`; a fixes-only first release is `0.0.1`. If no populated entries exist, stop.
-
-## Prepare the release PR
-
-1. Update the root package version in `Cargo.toml`.
-2. Refresh the matching root package version in `Cargo.lock` without changing dependency resolution unnecessarily.
-3. Move populated `Unreleased` entries into `## [X.Y.Z] - YYYY-MM-DD`, preserving categories and order.
-4. Recreate an empty `## [Unreleased]` section with Added, Changed, Deprecated, Removed, Fixed, and Security headings.
-5. Run `mise run check`. Before source migration, stop at the precondition instead of claiming success.
-6. Review the full diff and verify the version, changelog heading, lockfile, and release metadata agree.
-7. Describe the change with `jj describe -m "Release Flint vX.Y.Z"` and a concise body explaining the computed bump.
-8. Create `release/vX.Y.Z` with `jj bookmark create`.
-9. Push it with `jj git push -b release/vX.Y.Z`.
-10. Resolve the repository from `jj git remote list` and open a ready-for-review PR with `gh pr create -R <owner/repo>`.
-
-The PR title must be `Release Flint vX.Y.Z`. Its body must include the release notes and the reason for the PATCH, MINOR, or MAJOR bump. Never merge, enable auto-merge, enqueue a merge queue, or create the tag locally.
+Never bump `Cargo.toml`, edit the changelog by hand, create a tag, or merge the release pull request.
 
 ## Safety and completion
 
-The release PR must be the only release mutation. The merged-release GitHub Actions workflow performs validation, tagging, GitHub Release creation, and GHCR publication. Finish by checking `jj status` and report the PR URL. Never add co-author trailers.
+Do not merge the release pull request, enable auto-merge, or create the tag. Finish by reporting the run URL, the version momo derived, and the release pull request URL.
