@@ -21,7 +21,10 @@ LABEL org.opencontainers.image.title="Flint" \
       org.opencontainers.image.licenses="GPL-3.0-only" \
       org.opencontainers.image.version="$VERSION"
 
+# Upgrade the base image's packages so security fixes published after the pinned
+# digest (which can lag the security archive) are installed.
 RUN apt-get update \
+    && apt-get upgrade --no-install-recommends -y \
     && apt-get install --no-install-recommends -y ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
