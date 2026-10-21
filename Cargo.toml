@@ -17,7 +17,7 @@ bollard = "0.20.2"
 chrono = { version = "0.4.42", features = ["serde"] }
 futures-util = "0.3.31"
 hex = "0.4.3"
-hmac = "0.12.1"
+hmac = "0.13.0"
 reqwest = { version = "0.12.28", default-features = false, features = [
   "http2",
   "json",
