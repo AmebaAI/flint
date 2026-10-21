@@ -36,6 +36,7 @@ and carry no meaning now.
 - Update the `debian:bookworm-slim` runtime base image to pick up the patched `libpcre2-8-0` (CVE-2026-86145, CVE-2026-89157, CVE-2026-89161).
 - Upgrade the runtime image's Debian packages during the build so security fixes published after the pinned base image are installed, addressing the `perl` CVEs CVE-2026-13221, CVE-2026-42496, CVE-2026-8376, CVE-2026-42497, CVE-2026-48962, CVE-2026-57432, and CVE-2026-57433.
 - Add Dependabot configuration for Cargo, GitHub Actions, and Docker base images so these updates arrive automatically.
+- Update webpki-roots to 1.0.10 and rustls-webpki to 0.103.16 to address RUSTSEC-2026-0381 and RUSTSEC-2026-0382.
 
 ## [0.2.0] - 2026-08-20
 
