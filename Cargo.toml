@@ -13,7 +13,7 @@ async-trait = "0.1.92"
 aws-smithy-eventstream = "=0.61.2"
 aws-smithy-types = "=1.6.2"
 axum = { version = "0.8.9", features = ["multipart"] }
-bollard = "0.20.2"
+bollard = "0.21.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 futures-util = "0.3.31"
 hex = "0.4.3"
