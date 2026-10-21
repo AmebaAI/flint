@@ -24,7 +24,7 @@ Sections released before the momo adoption use Keep a Changelog headings
 (`Changed`, `Deprecated`, `Removed`, `Security`); they are preserved as history
 and carry no meaning now.
 
-## [Unreleased]
+## [0.2.1] - 2026-10-21
 
 ### Breaking
 
@@ -118,3 +118,7 @@ and carry no meaning now.
 - Runtime containers are created from immutable image identities, image
   requests are intersected with operator allowlists, and active sessions remain
   pinned to their original deployment snapshot.
+
+[0.2.1]: https://github.com/AmebaAI/flint/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/AmebaAI/flint/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/AmebaAI/flint/releases/tag/v0.1.0
