@@ -1,5 +1,8 @@
 [tools]
 rust = { version = "1.96.0", components = "rustfmt,clippy" }
+# Versioning and the changelog are momo's job (see docs/releasing.md). Pin the
+# CLI so `mise run check` and the release workflow resolve the same binary.
+"github:Jarvvski/momo" = "0.7.0"
 
 [tasks.fmt]
 description = "Format Rust source"
@@ -9,9 +12,15 @@ run = "cargo fmt --all"
 description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
 
+[tasks.changelog]
+description = "Validate the changelog with momo"
+# `momo status` is the changelog check: it fails on a changelog momo cannot read
+# (a duplicate Unreleased heading) and passes when nothing is unreleased.
+run = "momo status >/dev/null"
+
 [tasks.check]
 description = "Run the pre-release verification gate"
-depends = ["fmt:check", "lint", "build", "test"]
+depends = ["changelog", "fmt:check", "lint", "build", "test"]
 
 [tasks.lint]
 description = "Run Clippy with warnings as errors"

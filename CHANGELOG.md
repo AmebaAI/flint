@@ -1,27 +1,42 @@
 # Changelog
 
-All notable changes to Flint will be documented in this file.
+All notable changes to Flint are documented here, newest first, managed by
+[momo](https://github.com/Jarvvski/momo).
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/).
+Unreleased changes live under `## [Unreleased]`, grouped by kind:
 
-## [Unreleased]
+- `### Breaking` - an incompatible change
+- `### Added` - new functionality, backwards compatible
+- `### Fixed` - a backwards-compatible bug fix
+
+Record a change with `momo break|add|fix "<description>"`; momo owns the heading
+and the section it lands in. `momo status` derives the next version from the
+unreleased changes and the latest tag, and the release workflow runs `momo
+release` and tags the release, so **do not bump the version by hand**. See
+[docs/releasing.md](docs/releasing.md).
+
+Flint is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.2.0`
+means `>=0.2.0, <0.3.0`): `break` and `add` both raise the minor, `fix` raises
+the patch. That is momo's zero-aware rule. A 1.0.0 release needs the owner's
+explicit approval.
+
+Sections released before the momo adoption use Keep a Changelog headings
+(`Changed`, `Deprecated`, `Removed`, `Security`); they are preserved as history
+and carry no meaning now.
+
+## [0.2.1] - 2026-10-21
+
+### Breaking
 
 ### Added
 
-### Changed
-
-### Deprecated
-
-### Removed
-
 ### Fixed
 
-### Security
-
-- Update `rustls` to 0.23.45 to address RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption level boundaries).
+- Update `rustls` to 0.23.46 to address RUSTSEC-2026-0285 and RUSTSEC-2026-0346 through RUSTSEC-2026-0349.
 - Update the `debian:bookworm-slim` runtime base image to pick up the patched `libpcre2-8-0` (CVE-2026-86145, CVE-2026-89157, CVE-2026-89161).
+- Upgrade the runtime image's Debian packages during the build so security fixes published after the pinned base image are installed, addressing the `perl` CVEs CVE-2026-13221, CVE-2026-42496, CVE-2026-8376, CVE-2026-42497, CVE-2026-48962, CVE-2026-57432, and CVE-2026-57433.
 - Add Dependabot configuration for Cargo, GitHub Actions, and Docker base images so these updates arrive automatically.
+- Update webpki-roots to 1.0.10 and rustls-webpki to 0.103.16 to address RUSTSEC-2026-0381 and RUSTSEC-2026-0382.
 
 ## [0.2.0] - 2026-08-20
 
@@ -103,3 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Runtime containers are created from immutable image identities, image
   requests are intersected with operator allowlists, and active sessions remain
   pinned to their original deployment snapshot.
+
+[0.2.1]: https://github.com/AmebaAI/flint/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/AmebaAI/flint/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/AmebaAI/flint/releases/tag/v0.1.0
