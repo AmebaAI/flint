@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::http::{HeaderMap, Method, Uri};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
