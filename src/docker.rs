@@ -11,7 +11,7 @@ use bollard::{
     container::LogOutput,
     exec::{CreateExecOptions, StartExecOptions, StartExecResults},
     models::{
-        ContainerCreateBody, HostConfig, Mount, MountTypeEnum, MountVolumeOptions, PortBinding,
+        ContainerCreateBody, HostConfig, Mount, MountType, MountVolumeOptions, PortBinding,
         VolumeCreateRequest,
     },
     query_parameters::{
@@ -1780,7 +1780,7 @@ fn session_host_config(
     host_config.mounts = Some(vec![Mount {
         target: Some(mount_path.to_owned()),
         source: Some(volume_name.to_owned()),
-        typ: Some(MountTypeEnum::VOLUME),
+        typ: Some(MountType::VOLUME),
         read_only: Some(false),
         volume_options: Some(MountVolumeOptions {
             no_copy: Some(false),
@@ -2011,7 +2011,7 @@ mod tests {
             .expect("persistent session mount");
         assert_eq!(mount.source.as_deref(), Some("fixture-volume"));
         assert_eq!(mount.target.as_deref(), Some("/workspace"));
-        assert_eq!(mount.typ, Some(bollard::models::MountTypeEnum::VOLUME));
+        assert_eq!(mount.typ, Some(bollard::models::MountType::VOLUME));
         assert_eq!(mount.read_only, Some(false));
         assert_eq!(
             mount
