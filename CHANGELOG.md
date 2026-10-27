@@ -24,6 +24,12 @@ Sections released before the momo adoption use Keep a Changelog headings
 (`Changed`, `Deprecated`, `Removed`, `Security`); they are preserved as history
 and carry no meaning now.
 
+## [Unreleased]
+
+### Fixed
+
+- Update `ctutils` to 0.4.6 and `tokio` to 1.54.1 to address RUSTSEC-2026-0385 and RUSTSEC-2026-0386.
+
 ## [0.2.1] - 2026-10-21
 
 ### Breaking
