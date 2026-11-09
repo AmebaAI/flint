@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install toolchain
-        uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c
         with:
           cache: false
 
@@ -141,7 +141,7 @@ jobs:
           persist-credentials: false
 
       - name: Install toolchain
-        uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c
         with:
           cache: false
 
@@ -254,7 +254,7 @@ jobs:
           persist-credentials: false
 
       - name: Install toolchain
-        uses: jdx/mise-action@fc42bcc7ddbf51124c30f95a877a0c5168a3bfde
+        uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c
         with:
           cache: false
 
